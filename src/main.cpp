@@ -351,8 +351,6 @@ static bool load_snapshot(const fs::path& path, Snapshot& snap) {
         g_log.write(L"错误", L"快照校验失败：" + path.filename().wstring()
             + L"，快照Hash=" + (snap.hash.empty() ? L"EMPTY" : snap.hash)
             + L"，MetadataHash=" + (expected[0] == L'\0' ? L"EMPTY" : expected));
-    } else {
-        g_log.write(L"调试", L"快照校验成功：" + path.filename().wstring());
     }
     return hash_match;
 }
