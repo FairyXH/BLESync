@@ -1,15 +1,17 @@
 @echo off
-setlocal
+setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 if not exist build mkdir build
 if not exist build\BLESync.exe (
   where g++ >nul 2>&1 || (
-    echo g++ not found. Install MinGW-w64 and add it to PATH.
+    echo ERROR: g++ not found. Install MinGW-w64 and add it to PATH.
     exit /b 1
   )
+  echo Building BLESync...
   g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -DUNICODE -D_UNICODE -municode -Isrc src\main.cpp src\security.cpp -o build\BLESync.exe -static-libgcc -static-libstdc++ -lsetupapi -lcfgmgr32 -ladvapi32 -lbcrypt > build\compile.log 2>&1
   if errorlevel 1 (
     type build\compile.log
+    echo Build failed.
     exit /b 1
   )
 )

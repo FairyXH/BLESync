@@ -2,7 +2,6 @@
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <devguid.h>
-static const GUID BLE_DEVICE_CLASS_GUID = {0xe0cbf06c, 0xcd8b, 0x4647, {0xbb, 0x8a, 0x26, 0x3b, 0x43, 0xf0, 0xf9, 0x74}};
 #include <bcrypt.h>
 #include <sddl.h>
 #include <filesystem>
@@ -22,6 +21,14 @@ static const GUID BLE_DEVICE_CLASS_GUID = {0xe0cbf06c, 0xcd8b, 0x4647, {0xbb, 0x
 #include <cstring>
 #include <iostream>
 #include <functional>
+
+static const GUID BLE_DEVICE_CLASS_GUID = {
+    0xe0cbf06c,
+    0xcd8b,
+    0x4647,
+    {0xbb, 0x8a, 0x26, 0x3b, 0x43, 0xf0, 0xf9, 0x74}
+};
+
 #include "security.cpp"
 
 namespace fs = std::filesystem;
@@ -39,10 +46,31 @@ struct Value { DWORD type = REG_NONE; std::vector<BYTE> data; };
 struct Key { std::wstring name; std::map<std::wstring, Value> values; std::map<std::wstring, Key> children; };
 struct Snapshot { Key root; std::wstring hash; uint64_t bytes = 0; };
 
-static std::wstring trim(std::wstring s) { while (!s.empty() && iswspace(s.front())) s.erase(s.begin()); while (!s.empty() && iswspace(s.back())) s.pop_back(); return s; }
-static std::wstring lower(std::wstring s) { std::transform(s.begin(), s.end(), s.begin(), towlower); return s; }
-static std::wstring upper(std::wstring s) { std::transform(s.begin(), s.end(), s.begin(), towupper); return s; }
-static fs::path module_dir() { wchar_t b[32768]{}; DWORD n = GetModuleFileNameW(nullptr, b, 32768); return fs::path(std::wstring(b, n)).parent_path(); }
+static std::wstring trim(std::wstring s) {
+    while (!s.empty() && iswspace(s.front())) {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && iswspace(s.back())) {
+        s.pop_back();
+    }
+    return s;
+}
+
+static std::wstring lower(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), towlower);
+    return s;
+}
+
+static std::wstring upper(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), towupper);
+    return s;
+}
+
+static fs::path module_dir() {
+    wchar_t buffer[32768]{};
+    DWORD length = GetModuleFileNameW(nullptr, buffer, 32768);
+    return fs::path(std::wstring(buffer, length)).parent_path();
+}
 
 static Config load_config() {
     Config c; c.exe_dir = module_dir(); const auto ini = (c.exe_dir / L"BLESync.ini").wstring(); wchar_t buffer[32768]{};
@@ -53,7 +81,6 @@ static Config load_config() {
     return c;
 }
 
-static std::wstring utf8_to_wide(const std::string& value) { if (value.empty()) return L""; int n = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0); std::wstring result(n, L'\0'); MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), n); return result; }
 static std::string wide_to_utf8(const std::wstring& value) { if (value.empty()) return {}; int n = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr); std::string result(n, '\0'); WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), n, nullptr, nullptr); return result; }
 
 static std::wstring format_message(const wchar_t* level, const std::wstring& message) { SYSTEMTIME t{}; GetLocalTime(&t); std::wstringstream out; out << L"[" << std::setfill(L'0') << std::setw(2) << t.wHour << L":" << std::setw(2) << t.wMinute << L":" << std::setw(2) << t.wSecond << L"] [" << level << L"] " << message; return out.str(); }
@@ -76,8 +103,20 @@ static bool is_admin() {
 
 static bool protect_storage(const fs::path& path) {
     PSECURITY_DESCRIPTOR sd = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) return false;
-    std::error_code e; fs::create_directories(path, e); const bool ok = !e && SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, sd) != FALSE; LocalFree(sd); return ok;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            SDDL_REVISION_1,
+            &sd,
+            nullptr)) {
+        return false;
+    }
+
+    std::error_code error;
+    fs::create_directories(path, error);
+    const bool ok = !error
+        && SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, sd) != FALSE;
+    LocalFree(sd);
+    return ok;
 }
 
 static void u32(std::ostream& out, uint32_t value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
@@ -145,36 +184,99 @@ static bool install_service() { if (!is_admin()) return false; const Config c = 
 static bool uninstall_service() { if (!is_admin()) return false; SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS); if (!manager) return false; SC_HANDLE service = OpenServiceW(manager, SERVICE_NAME, SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE); if (!service) { CloseServiceHandle(manager); return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST; } SERVICE_STATUS status{}; ControlService(service, SERVICE_CONTROL_STOP, &status); const bool ok = DeleteService(service) != FALSE; CloseServiceHandle(service); CloseServiceHandle(manager); return ok; }
 
 static void worker() {
-    const Config c = load_config(); g_log.init(c); std::error_code e; fs::create_directories(c.storage / L"registry", e); if (e || !protect_storage(c.storage)) { g_log.write(L"ERROR", L"Storage initialization or ACL failed"); return; }
-    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\BLESync.StorageLock"); if (!mutex) { g_log.write(L"ERROR", L"Cannot create storage mutex"); return; }
-    const DWORD lock_result = WaitForSingleObject(mutex, 2000); if (lock_result != WAIT_OBJECT_0 && lock_result != WAIT_ABANDONED) { g_log.write(L"ERROR", L"Storage mutex timeout; worker stopped safely"); CloseHandle(mutex); return; }
-    g_log.write(L"INFO", L"Service worker started"); bool have_local = false; Snapshot local_devices, local_keys; const fs::path devices_file = c.storage / L"registry" / L"devices.regdata", keys_file = c.storage / L"registry" / L"keys.regdata";
+    const Config c = load_config(); g_log.init(c); std::error_code e; fs::create_directories(c.storage / L"registry", e); if (e || !protect_storage(c.storage)) { g_log.write(L"错误", L"Storage 初始化或 ACL 设置失败，服务工作线程已停止"); return; }
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\BLESync.StorageLock"); if (!mutex) { g_log.write(L"错误", L"无法创建 Storage 互斥体"); return; }
+    const DWORD lock_result = WaitForSingleObject(mutex, 2000); if (lock_result != WAIT_OBJECT_0 && lock_result != WAIT_ABANDONED) { g_log.write(L"错误", L"等待 Storage 互斥体超时，已安全停止工作线程"); CloseHandle(mutex); return; }
+    g_log.write(L"信息", L"服务已启动"); bool have_local = false; Snapshot local_devices, local_keys; const fs::path devices_file = c.storage / L"registry" / L"devices.regdata", keys_file = c.storage / L"registry" / L"keys.regdata";
     while (!g_stop) {
         const auto service = service_state(L"bthserv"); bool radio_known = false, radio_enabled = false; radio_state(radio_known, radio_enabled);
-        if (service.dwCurrentState == SERVICE_START_PENDING || service.dwCurrentState == SERVICE_STOP_PENDING) g_log.write(L"DEBUG", L"Bluetooth service pending; synchronization deferred");
+        if (service.dwCurrentState == SERVICE_START_PENDING || service.dwCurrentState == SERVICE_STOP_PENDING) g_log.write(L"调试", L"Bluetooth 服务正在切换状态，暂缓同步");
         else if (service.dwCurrentState == SERVICE_RUNNING && radio_known && radio_enabled) {
             Snapshot now_devices, now_keys; const bool got_devices = capture_registry(DEV_ROOT, now_devices); const bool got_keys = capture_registry(KEY_ROOT, now_keys);
             if (got_devices && got_keys) {
                 Snapshot stored_devices, stored_keys; const bool has_stored = load_snapshot(devices_file, stored_devices) && load_snapshot(keys_file, stored_keys);
                 if (!has_stored || !have_local) {
                     if (has_stored && !have_local && restore_registry(DEV_ROOT, stored_devices) && restore_registry(KEY_ROOT, stored_keys)) {
-                        Snapshot restored_devices, restored_keys; if (capture_registry(DEV_ROOT, restored_devices) && capture_registry(KEY_ROOT, restored_keys)) { local_devices = std::move(restored_devices); local_keys = std::move(restored_keys); have_local = true; g_log.write(L"INFO", L"Valid persistent Bluetooth state restored and verified"); }
+                        Snapshot restored_devices, restored_keys; if (capture_registry(DEV_ROOT, restored_devices) && capture_registry(KEY_ROOT, restored_keys)) { local_devices = std::move(restored_devices); local_keys = std::move(restored_keys); have_local = true; g_log.write(L"信息", L"有效的持久化蓝牙状态已恢复并通过验证"); }
                     } else {
-                        save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); have_local = true; g_log.write(L"INFO", L"Local Bluetooth state published as baseline");
+                        save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); have_local = true; g_log.write(L"信息", L"本地蓝牙状态已发布为基线");
                     }
                 }
-                else if (!equal_key(local_devices.root, now_devices.root) || !equal_key(local_keys.root, now_keys.root)) { save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); g_log.write(L"INFO", L"Stable local Bluetooth change published; additions and deletions mirrored"); }
-                else if (!equal_key(now_devices.root, stored_devices.root) || !equal_key(now_keys.root, stored_keys.root)) g_log.write(L"WARN", L"Persistent state differs from local state; user-first policy keeps local state and records conflict");
-            } else g_log.write(L"DEBUG", L"Bluetooth snapshot unavailable; no restore or service control");
-        } else if (!radio_known || !radio_enabled) g_log.write(L"DEBUG", L"Bluetooth radio unavailable or disabled; no automatic enable or restart");
+                else if (!equal_key(local_devices.root, now_devices.root) || !equal_key(local_keys.root, now_keys.root)) { save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); g_log.write(L"信息", L"稳定的本地蓝牙变化已发布，新增和删除均已镜像"); }
+                else if (!equal_key(now_devices.root, stored_devices.root) || !equal_key(now_keys.root, stored_keys.root)) g_log.write(L"警告", L"持久化状态与本地状态不一致，按用户优先策略保留本地状态并记录冲突");
+            } else g_log.write(L"调试", L"蓝牙快照不可用，不执行恢复或服务控制");
+        } else if (!radio_known || !radio_enabled) g_log.write(L"调试", L"蓝牙适配器不可用或已禁用，不自动启用或重启服务");
         for (int i = 0; i < c.interval && !g_stop; ++i) std::this_thread::sleep_for(1s);
     }
-    ReleaseMutex(mutex); CloseHandle(mutex); g_log.write(L"INFO", L"Service worker stopped");
+    ReleaseMutex(mutex); CloseHandle(mutex); g_log.write(L"信息", L"服务工作线程已停止");
 }
 static void WINAPI service_control(DWORD code) { if (code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN) { g_stop = true; report_service(SERVICE_STOP_PENDING, NO_ERROR, 5000); } }
 static void WINAPI service_main(DWORD, LPWSTR*) { g_status_handle = RegisterServiceCtrlHandlerW(SERVICE_NAME, service_control); if (!g_status_handle) return; report_service(SERVICE_START_PENDING, NO_ERROR, 5000); std::thread thread(worker); report_service(SERVICE_RUNNING); thread.join(); report_service(SERVICE_STOPPED); }
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc > 1) { const auto arg = lower(argv[1]); if (arg == L"--install") return install_service() ? 0 : 1; if (arg == L"--uninstall") return uninstall_service() ? 0 : 1; if (arg == L"--console") { worker(); return 0; } if (arg == L"--capture") { const Config c = load_config(); Snapshot d, k; return capture_registry(DEV_ROOT, d) && capture_registry(KEY_ROOT, k) && save_snapshot(c.storage / L"registry" / L"devices.regdata", d) && save_snapshot(c.storage / L"registry" / L"keys.regdata", k) ? 0 : 1; } if (arg == L"--status") { const auto s = service_state(L"bthserv"); bool known = false, enabled = false; radio_state(known, enabled); std::wcout << L"bthserv=" << s.dwCurrentState << L" radio_known=" << known << L" radio_enabled=" << enabled << L"\n"; return 0; } return 2; }
-    SERVICE_TABLE_ENTRYW table[] = {{const_cast<LPWSTR>(SERVICE_NAME), service_main}, {nullptr, nullptr}}; if (!StartServiceCtrlDispatcherW(table)) { if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) { worker(); return 0; } return 1; } return 0;
+    if (argc > 1) {
+        const std::wstring arg = lower(argv[1]);
+        if (arg == L"--help" || arg == L"-h" || arg == L"/?" || arg == L"/h") {
+            std::wcout
+                << L"BLESync - Windows 蓝牙配置持久化服务\n\n"
+                << L"用法：\n"
+                << L"  BLESync.exe --help     显示此帮助\n"
+                << L"  BLESync.exe /?         显示此帮助\n"
+                << L"  BLESync.exe --install  安装或更新并启动 BLESync 服务\n"
+                << L"  BLESync.exe --uninstall 卸载 BLESync 服务\n"
+                << L"  BLESync.exe --status   显示 Bluetooth 服务和适配器状态\n"
+                << L"  BLESync.exe --capture 以当前权限捕获 Devices/Keys 快照\n"
+                << L"  BLESync.exe --console 以前台模式运行服务工作线程\n\n"
+                << L"配置文件：BLESync.ini（必须与 EXE 位于同一目录）\n"
+                << L"服务名：BLESync\n"
+                << L"服务账户：LocalSystem\n";
+            return 0;
+        }
+        if (arg == L"--install") {
+            return install_service() ? 0 : 1;
+        }
+        if (arg == L"--uninstall") {
+            return uninstall_service() ? 0 : 1;
+        }
+        if (arg == L"--console") {
+            worker();
+            return 0;
+        }
+        if (arg == L"--capture") {
+            const Config c = load_config();
+            Snapshot devices;
+            Snapshot keys;
+            return capture_registry(DEV_ROOT, devices)
+                    && capture_registry(KEY_ROOT, keys)
+                    && save_snapshot(c.storage / L"registry" / L"devices.regdata", devices)
+                    && save_snapshot(c.storage / L"registry" / L"keys.regdata", keys)
+                ? 0
+                : 1;
+        }
+        if (arg == L"--status") {
+            const auto service = service_state(L"bthserv");
+            bool known = false;
+            bool enabled = false;
+            radio_state(known, enabled);
+            std::wcout
+                << L"Bluetooth 服务状态：" << service.dwCurrentState << L"\n"
+                << L"Bluetooth 适配器已知：" << (known ? L"是" : L"否") << L"\n"
+                << L"Bluetooth 适配器已启用：" << (enabled ? L"是" : L"否") << L"\n";
+            return 0;
+        }
+        std::wcerr << L"错误：未知参数。使用 --help 或 /? 查看用法。\n";
+        return 2;
+    }
+    SERVICE_TABLE_ENTRYW table[] = {
+        {const_cast<LPWSTR>(SERVICE_NAME), service_main},
+        {nullptr, nullptr}
+    };
+    if (!StartServiceCtrlDispatcherW(table)) {
+        if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+            worker();
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
 }

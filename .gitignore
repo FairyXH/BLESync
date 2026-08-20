@@ -1,2 +1,4 @@
 build/
 build.log
+direct-build.err
+direct-build.log

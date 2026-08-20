@@ -42,7 +42,17 @@ build\BLESync.ini
 
 构建脚本使用 `--console=plain` 等 Gradle 选项不适用；本项目完全使用 MinGW `g++`，编译输出写入 `build\compile.log`。
 
-## 安装和卸载
+## 命令行帮助
+
+```text
+BLESync.exe --help
+BLESync.exe -h
+BLESync.exe /?
+BLESync.exe /h
+```
+
+帮助输出、状态输出、错误提示和服务日志使用简体中文；参数名保持英文以兼容脚本。
+
 
 使用管理员命令提示符运行：
 

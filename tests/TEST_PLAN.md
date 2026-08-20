@@ -1,4 +1,18 @@
-# BLESync 测试计划
+# BLESync 命令行与日志本地化
+
+命令行输出、帮助信息、错误提示和服务日志统一使用简体中文。参数名称仍保留稳定的英文形式，便于脚本调用。
+
+支持帮助参数：
+
+```text
+BLESync.exe --help
+BLESync.exe -h
+BLESync.exe /?
+BLESync.exe /h
+```
+
+未知参数返回退出码 `2`，并提示使用 `--help` 或 `/?` 查看用法。
+
 
 ## 自动测试
 
