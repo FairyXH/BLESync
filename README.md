@@ -95,7 +95,10 @@ LogLevel=INFO
 
 `ScanInterval` 最小值为 1 秒。Storage 目录不存在时由服务创建。配置或目录初始化失败时，服务停止同步，不会强制启动或重启蓝牙服务。
 
-## 持久化目录
+| `StoragePath` | `D:\BLESyncData` | 蓝牙快照和日志目录 |
+| `ScanInterval` | `5` | 扫描间隔，单位为秒，最小 1 秒 |
+| `LogLevel` | `INFO` | 日志级别预留配置 |
+
 
 默认结构：
 
@@ -125,7 +128,19 @@ D:\BLESyncData\
 - 使用全局命名互斥体保护共享 Storage，并设置 2 秒超时；超时后安全退出当前工作线程，不无限等待。
 - 正常运行期间绝不周期性 stop/start `bthserv`。
 
-## 安全
+## 详细日志
+
+服务会记录但不会记录 Link Key 原文：
+
+- 当前已配对设备数量和脱敏后的设备标识。
+- Registry 子键增加、删除。
+- Registry value 增加、删除、修改。
+- value 类型和字节长度；不会写入敏感二进制内容。
+- 从 Storage 恢复时向系统写入的 Devices/Keys 设置值、删除值、访问键和删除键数量。
+- 恢复完成后的重新读取验证结果。
+- 本地和持久化状态冲突时的两份设备列表摘要。
+
+
 
 Storage ACL 限制为：
 

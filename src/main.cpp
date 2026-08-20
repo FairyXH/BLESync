@@ -153,28 +153,250 @@ static bool save_snapshot(const fs::path& path, const Snapshot& snap) {
         if (!MoveFileExW(path.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return false;
     }
     if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileW(temp.c_str()); return false; }
-    std::error_code state_error; fs::create_directories(path.parent_path().parent_path() / L"state", state_error);
+    std::error_code state_error;
+    fs::create_directories(path.parent_path().parent_path() / L"state", state_error);
     const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos; const std::wstring meta_key = is_keys ? L"KeysHash" : L"DevicesHash"; wchar_t other[256]{}; const std::wstring other_key = is_keys ? L"DevicesHash" : L"KeysHash"; const auto meta_path = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring(); GetPrivateProfileStringW(L"Meta", other_key.c_str(), L"", other, 256, meta_path.c_str());
     std::string meta_text = "[Meta]\r\n" + wide_to_utf8(meta_key) + "=" + wide_to_utf8(hash) + "\r\n" + wide_to_utf8(other_key) + "=" + wide_to_utf8(other) + "\r\nBytes=" + std::to_string(payload.size()) + "\r\nUpdatedTick=" + std::to_string(GetTickCount64()) + "\r\n";
     HANDLE mh = CreateFileW((path.parent_path().parent_path() / L"state" / L"metadata.ini").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (mh != INVALID_HANDLE_VALUE) { DWORD written = 0; WriteFile(mh, meta_text.data(), static_cast<DWORD>(meta_text.size()), &written, nullptr); FlushFileBuffers(mh); CloseHandle(mh); }
     return true;
 }
 static bool load_snapshot(const fs::path& path, Snapshot& snap) { std::ifstream in(path, std::ios::binary); if (!in) return false; std::vector<BYTE> payload((std::istreambuf_iterator<char>(in)), {}); if (payload.size() < 12 || std::memcmp(payload.data(), "BLESNAP2", 8) != 0) return false; uint32_t version = 0; std::istringstream data(std::string(payload.begin(), payload.end()), std::ios::binary); char magic[8]; data.read(magic, 8); if (!ru32(data, version) || version != 2 || !decode_key(data, snap.root)) return false; snap.hash = sha256(payload); snap.bytes = payload.size(); if (snap.hash.empty()) return false; wchar_t expected[256]{}; const auto ini = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring(); const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos; const wchar_t* hash_key = is_keys ? L"KeysHash" : L"DevicesHash"; GetPrivateProfileStringW(L"Meta", hash_key, L"", expected, 256, ini.c_str()); return expected[0] != L'\0' && snap.hash == expected; }
-static bool equal_key(const Key& a, const Key& b) { if (a.values.size() != b.values.size() || a.children.size() != b.children.size()) return false; for (const auto& [n, v] : a.values) { auto it = b.values.find(n); if (it == b.values.end() || v.type != it->second.type || v.data != it->second.data) return false; } for (const auto& [n, c] : a.children) { auto it = b.children.find(n); if (it == b.children.end() || !equal_key(c, it->second)) return false; } return true; }
-
-static bool apply_key(HKEY parent, const Key& desired, bool allow_delete) {
-    HKEY h = nullptr; if (RegCreateKeyExW(parent, desired.name.c_str(), 0, nullptr, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, nullptr, &h, nullptr) != ERROR_SUCCESS) return false;
-    DWORD value_count = 0; RegQueryInfoKeyW(h, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &value_count, nullptr, nullptr, nullptr, nullptr); std::set<std::wstring> current_values;
-    for (DWORD i = 0; i < value_count; ++i) { wchar_t name[1024]{}; DWORD len = 1024; if (RegEnumValueW(h, i, name, &len, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) current_values.emplace(name); }
-    for (const auto& [name, value] : desired.values) { if (RegSetValueExW(h, name.c_str(), 0, value.type, value.data.data(), static_cast<DWORD>(value.data.size())) != ERROR_SUCCESS) { RegCloseKey(h); return false; } current_values.erase(name); }
-    if (allow_delete) for (const auto& name : current_values) RegDeleteValueW(h, name.c_str());
-    DWORD subkeys = 0; RegQueryInfoKeyW(h, nullptr, nullptr, nullptr, &subkeys, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr); std::set<std::wstring> current_children;
-    for (DWORD i = 0; i < subkeys; ++i) { wchar_t name[1024]{}; DWORD len = 1024; if (RegEnumKeyExW(h, i, name, &len, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) current_children.emplace(name); }
-    for (const auto& [name, child] : desired.children) { if (!apply_key(h, child, allow_delete)) { RegCloseKey(h); return false; } current_children.erase(name); }
-    if (allow_delete) { for (const auto& name : current_children) RegDeleteTreeW(h, name.c_str()); }
-    RegCloseKey(h); return true;
+static bool equal_key(const Key& a, const Key& b) {
+    if (a.values.size() != b.values.size() || a.children.size() != b.children.size()) {
+        return false;
+    }
+    for (const auto& [name, value] : a.values) {
+        const auto it = b.values.find(name);
+        if (it == b.values.end()
+            || value.type != it->second.type
+            || value.data != it->second.data) {
+            return false;
+        }
+    }
+    for (const auto& [name, child] : a.children) {
+        const auto it = b.children.find(name);
+        if (it == b.children.end() || !equal_key(child, it->second)) {
+            return false;
+        }
+    }
+    return true;
 }
-static bool restore_registry(const wchar_t* root, const Snapshot& snap) { HKEY h = nullptr; if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, root, 0, nullptr, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, nullptr, &h, nullptr) != ERROR_SUCCESS) return false; bool ok = true; for (const auto& [name, child] : snap.root.children) ok = ok && apply_key(h, child, true); RegCloseKey(h); return ok; }
+
+static std::wstring redact_identifier(const std::wstring& value) {
+    if (value.size() <= 4) {
+        return L"****";
+    }
+    if (value.size() <= 8) {
+        return value.substr(0, 2) + L"****" + value.substr(value.size() - 2);
+    }
+    return value.substr(0, 4) + L"****" + value.substr(value.size() - 4);
+}
+
+static std::wstring registry_type_name(DWORD type) {
+    switch (type) {
+    case REG_SZ: return L"REG_SZ";
+    case REG_EXPAND_SZ: return L"REG_EXPAND_SZ";
+    case REG_BINARY: return L"REG_BINARY";
+    case REG_DWORD: return L"REG_DWORD";
+    case REG_QWORD: return L"REG_QWORD";
+    case REG_MULTI_SZ: return L"REG_MULTI_SZ";
+    default: return L"REG_" + std::to_wstring(type);
+    }
+}
+
+static void log_device_list(const Key& root, const wchar_t* title) {
+    std::wstring text = title;
+    text += L"（数量=" + std::to_wstring(root.children.size()) + L"）：";
+    if (root.children.empty()) {
+        text += L"无";
+    } else {
+        bool first = true;
+        for (const auto& [name, child] : root.children) {
+            if (!first) {
+                text += L"、";
+            }
+            text += redact_identifier(name);
+            first = false;
+        }
+    }
+    g_log.write(L"信息", text);
+}
+
+static void log_snapshot_diff(const Key& before, const Key& after, const wchar_t* scope) {
+    std::wstring prefix = std::wstring(L"注册表变化[" ) + scope + L"] ";
+    for (const auto& [name, child] : after.children) {
+        if (before.children.find(name) == before.children.end()) {
+            g_log.write(L"信息", prefix + L"增加：" + redact_identifier(name));
+        }
+    }
+    for (const auto& [name, child] : before.children) {
+        if (after.children.find(name) == after.children.end()) {
+            g_log.write(L"信息", prefix + L"删除：" + redact_identifier(name));
+        }
+    }
+    for (const auto& [name, child] : after.children) {
+        const auto old = before.children.find(name);
+        if (old == before.children.end()) {
+            continue;
+        }
+        for (const auto& [value_name, value] : child.values) {
+            const auto old_value = old->second.values.find(value_name);
+            if (old_value == old->second.values.end()) {
+                g_log.write(L"信息", prefix + L"设备 " + redact_identifier(name)
+                    + L" 增加值：" + value_name + L"，类型=" + registry_type_name(value.type)
+                    + L"，长度=" + std::to_wstring(value.data.size()));
+            } else if (old_value->second.type != value.type || old_value->second.data != value.data) {
+                g_log.write(L"信息", prefix + L"设备 " + redact_identifier(name)
+                    + L" 修改值：" + value_name + L"，类型=" + registry_type_name(value.type)
+                    + L"，长度=" + std::to_wstring(value.data.size()));
+            }
+        }
+        for (const auto& [value_name, value] : old->second.values) {
+            if (child.values.find(value_name) == child.values.end()) {
+                g_log.write(L"信息", prefix + L"设备 " + redact_identifier(name)
+                    + L" 删除值：" + value_name);
+            }
+        }
+    }
+}
+
+struct RegistryWriteSummary {
+    size_t set_values = 0;
+    size_t deleted_values = 0;
+    size_t visited_keys = 0;
+    size_t deleted_keys = 0;
+};
+static bool apply_key(
+    HKEY parent,
+    const Key& desired,
+    bool allow_delete,
+    RegistryWriteSummary& summary
+) {
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(
+            parent,
+            desired.name.c_str(),
+            0,
+            nullptr,
+            0,
+            KEY_READ | KEY_WRITE | KEY_WOW64_64KEY,
+            nullptr,
+            &h,
+            nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    ++summary.visited_keys;
+
+    DWORD value_count = 0;
+    RegQueryInfoKeyW(
+        h,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &value_count,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr);
+    std::set<std::wstring> current_values;
+    for (DWORD i = 0; i < value_count; ++i) {
+        wchar_t name[1024]{};
+        DWORD length = 1024;
+        if (RegEnumValueW(h, i, name, &length, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            current_values.emplace(name);
+        }
+    }
+
+    for (const auto& [name, value] : desired.values) {
+        if (RegSetValueExW(
+                h,
+                name.c_str(),
+                0,
+                value.type,
+                value.data.data(),
+                static_cast<DWORD>(value.data.size())) != ERROR_SUCCESS) {
+            RegCloseKey(h);
+            return false;
+        }
+        ++summary.set_values;
+        current_values.erase(name);
+    }
+    if (allow_delete) {
+        for (const auto& name : current_values) {
+            if (RegDeleteValueW(h, name.c_str()) == ERROR_SUCCESS) {
+                ++summary.deleted_values;
+            }
+        }
+    }
+
+    DWORD subkeys = 0;
+    RegQueryInfoKeyW(
+        h,
+        nullptr,
+        nullptr,
+        nullptr,
+        &subkeys,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr);
+    std::set<std::wstring> current_children;
+    for (DWORD i = 0; i < subkeys; ++i) {
+        wchar_t name[1024]{};
+        DWORD length = 1024;
+        if (RegEnumKeyExW(h, i, name, &length, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            current_children.emplace(name);
+        }
+    }
+    for (const auto& [name, child] : desired.children) {
+        if (!apply_key(h, child, allow_delete, summary)) {
+            RegCloseKey(h);
+            return false;
+        }
+        current_children.erase(name);
+    }
+    if (allow_delete) {
+        for (const auto& name : current_children) {
+            if (RegDeleteTreeW(h, name.c_str()) == ERROR_SUCCESS) {
+                ++summary.deleted_keys;
+            }
+        }
+    }
+    RegCloseKey(h);
+    return true;
+}
+
+static bool restore_registry(
+    const wchar_t* root,
+    const Snapshot& snap,
+    RegistryWriteSummary& summary
+) {
+    HKEY h = nullptr;
+    if (RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            root,
+            0,
+            nullptr,
+            0,
+            KEY_READ | KEY_WRITE | KEY_WOW64_64KEY,
+            nullptr,
+            &h,
+            nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    bool ok = true;
+    for (const auto& [name, child] : snap.root.children) {
+        ok = ok && apply_key(h, child, true, summary);
+    }
+    RegCloseKey(h);
+    return ok;
+}
 
 static SERVICE_STATUS_PROCESS service_state(const wchar_t* name) { SERVICE_STATUS_PROCESS result{}; SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT); if (!manager) return result; SC_HANDLE service = OpenServiceW(manager, name, SERVICE_QUERY_STATUS); if (service) { DWORD bytes = 0; QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&result), sizeof(result), &bytes); CloseServiceHandle(service); } CloseServiceHandle(manager); return result; }
 static bool radio_state(bool& known, bool& enabled) { known = false; enabled = false; HDEVINFO info = SetupDiGetClassDevsW(&BLE_DEVICE_CLASS_GUID, nullptr, nullptr, DIGCF_PRESENT); if (info == INVALID_HANDLE_VALUE) return false; SP_DEVINFO_DATA data{}; data.cbSize = sizeof(data); for (DWORD i = 0; SetupDiEnumDeviceInfo(info, i, &data); ++i) { DWORD status = 0, problem = 0; if (CM_Get_DevNode_Status(&status, &problem, data.DevInst, 0) == CR_SUCCESS) { known = true; enabled = (status & DN_STARTED) != 0 && problem == 0; break; } } SetupDiDestroyDeviceInfoList(info); return known; }
@@ -184,31 +406,136 @@ static bool install_service() { if (!is_admin()) return false; const Config c = 
 static bool uninstall_service() { if (!is_admin()) return false; SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS); if (!manager) return false; SC_HANDLE service = OpenServiceW(manager, SERVICE_NAME, SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE); if (!service) { CloseServiceHandle(manager); return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST; } SERVICE_STATUS status{}; ControlService(service, SERVICE_CONTROL_STOP, &status); const bool ok = DeleteService(service) != FALSE; CloseServiceHandle(service); CloseServiceHandle(manager); return ok; }
 
 static void worker() {
-    const Config c = load_config(); g_log.init(c); std::error_code e; fs::create_directories(c.storage / L"registry", e); if (e || !protect_storage(c.storage)) { g_log.write(L"错误", L"Storage 初始化或 ACL 设置失败，服务工作线程已停止"); return; }
-    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\BLESync.StorageLock"); if (!mutex) { g_log.write(L"错误", L"无法创建 Storage 互斥体"); return; }
-    const DWORD lock_result = WaitForSingleObject(mutex, 2000); if (lock_result != WAIT_OBJECT_0 && lock_result != WAIT_ABANDONED) { g_log.write(L"错误", L"等待 Storage 互斥体超时，已安全停止工作线程"); CloseHandle(mutex); return; }
-    g_log.write(L"信息", L"服务已启动"); bool have_local = false; Snapshot local_devices, local_keys; const fs::path devices_file = c.storage / L"registry" / L"devices.regdata", keys_file = c.storage / L"registry" / L"keys.regdata";
-    while (!g_stop) {
-        const auto service = service_state(L"bthserv"); bool radio_known = false, radio_enabled = false; radio_state(radio_known, radio_enabled);
-        if (service.dwCurrentState == SERVICE_START_PENDING || service.dwCurrentState == SERVICE_STOP_PENDING) g_log.write(L"调试", L"Bluetooth 服务正在切换状态，暂缓同步");
-        else if (service.dwCurrentState == SERVICE_RUNNING && radio_known && radio_enabled) {
-            Snapshot now_devices, now_keys; const bool got_devices = capture_registry(DEV_ROOT, now_devices); const bool got_keys = capture_registry(KEY_ROOT, now_keys);
-            if (got_devices && got_keys) {
-                Snapshot stored_devices, stored_keys; const bool has_stored = load_snapshot(devices_file, stored_devices) && load_snapshot(keys_file, stored_keys);
-                if (!has_stored || !have_local) {
-                    if (has_stored && !have_local && restore_registry(DEV_ROOT, stored_devices) && restore_registry(KEY_ROOT, stored_keys)) {
-                        Snapshot restored_devices, restored_keys; if (capture_registry(DEV_ROOT, restored_devices) && capture_registry(KEY_ROOT, restored_keys)) { local_devices = std::move(restored_devices); local_keys = std::move(restored_keys); have_local = true; g_log.write(L"信息", L"有效的持久化蓝牙状态已恢复并通过验证"); }
-                    } else {
-                        save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); have_local = true; g_log.write(L"信息", L"本地蓝牙状态已发布为基线");
-                    }
-                }
-                else if (!equal_key(local_devices.root, now_devices.root) || !equal_key(local_keys.root, now_keys.root)) { save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); g_log.write(L"信息", L"稳定的本地蓝牙变化已发布，新增和删除均已镜像"); }
-                else if (!equal_key(now_devices.root, stored_devices.root) || !equal_key(now_keys.root, stored_keys.root)) g_log.write(L"警告", L"持久化状态与本地状态不一致，按用户优先策略保留本地状态并记录冲突");
-            } else g_log.write(L"调试", L"蓝牙快照不可用，不执行恢复或服务控制");
-        } else if (!radio_known || !radio_enabled) g_log.write(L"调试", L"蓝牙适配器不可用或已禁用，不自动启用或重启服务");
-        for (int i = 0; i < c.interval && !g_stop; ++i) std::this_thread::sleep_for(1s);
+    const Config config = load_config();
+    g_log.init(config);
+
+    std::error_code error;
+    fs::create_directories(config.storage / L"registry", error);
+    if (error || !protect_storage(config.storage)) {
+        g_log.write(L"错误", L"Storage 初始化或 ACL 设置失败，服务工作线程已停止");
+        return;
     }
-    ReleaseMutex(mutex); CloseHandle(mutex); g_log.write(L"信息", L"服务工作线程已停止");
+
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\BLESync.StorageLock");
+    if (!mutex) {
+        g_log.write(L"错误", L"无法创建 Storage 互斥体");
+        return;
+    }
+
+    const DWORD lock_result = WaitForSingleObject(mutex, 2000);
+    if (lock_result != WAIT_OBJECT_0 && lock_result != WAIT_ABANDONED) {
+        g_log.write(L"错误", L"等待 Storage 互斥体超时，已安全停止工作线程");
+        CloseHandle(mutex);
+        return;
+    }
+
+    g_log.write(L"信息", L"服务已启动");
+
+    bool have_local = false;
+    Snapshot local_devices;
+    Snapshot local_keys;
+    const fs::path devices_file = config.storage / L"registry" / L"devices.regdata";
+    const fs::path keys_file = config.storage / L"registry" / L"keys.regdata";
+
+    while (!g_stop) {
+        const auto service = service_state(L"bthserv");
+        bool radio_known = false;
+        bool radio_enabled = false;
+        radio_state(radio_known, radio_enabled);
+
+        if (service.dwCurrentState == SERVICE_START_PENDING
+            || service.dwCurrentState == SERVICE_STOP_PENDING) {
+            g_log.write(L"调试", L"Bluetooth 服务正在切换状态，暂缓同步");
+        } else if (service.dwCurrentState == SERVICE_RUNNING
+            && radio_known
+            && radio_enabled) {
+            Snapshot now_devices;
+            Snapshot now_keys;
+            const bool got_devices = capture_registry(DEV_ROOT, now_devices);
+            const bool got_keys = capture_registry(KEY_ROOT, now_keys);
+
+            if (got_devices && got_keys) {
+                Snapshot stored_devices;
+                Snapshot stored_keys;
+                const bool has_stored = load_snapshot(devices_file, stored_devices)
+                    && load_snapshot(keys_file, stored_keys);
+
+                bool restored = false;
+                if (!has_stored || !have_local) {
+                    if (has_stored) {
+                        RegistryWriteSummary devices_write;
+                        RegistryWriteSummary keys_write;
+                        if (restore_registry(DEV_ROOT, stored_devices, devices_write)
+                            && restore_registry(KEY_ROOT, stored_keys, keys_write)) {
+                            g_log.write(
+                                L"信息",
+                                L"已向系统写入蓝牙注册表：Devices 设置值="
+                                    + std::to_wstring(devices_write.set_values)
+                                    + L"，删除值=" + std::to_wstring(devices_write.deleted_values)
+                                    + L"，访问键=" + std::to_wstring(devices_write.visited_keys)
+                                    + L"，删除键=" + std::to_wstring(devices_write.deleted_keys)
+                                    + L"；Keys 设置值="
+                                    + std::to_wstring(keys_write.set_values)
+                                    + L"，删除值=" + std::to_wstring(keys_write.deleted_values)
+                                    + L"，访问键=" + std::to_wstring(keys_write.visited_keys)
+                                    + L"，删除键=" + std::to_wstring(keys_write.deleted_keys));
+                            restored = true;
+                        }
+                    }
+
+                    if (restored) {
+                        Snapshot restored_devices;
+                        Snapshot restored_keys;
+                        if (capture_registry(DEV_ROOT, restored_devices)
+                            && capture_registry(KEY_ROOT, restored_keys)) {
+                            local_devices = std::move(restored_devices);
+                            local_keys = std::move(restored_keys);
+                            have_local = true;
+                            g_log.write(L"信息", L"有效的持久化蓝牙状态已恢复并通过验证");
+                            log_device_list(local_devices.root, L"当前已配对设备");
+                        }
+                    } else {
+                        save_snapshot(devices_file, now_devices);
+                        save_snapshot(keys_file, now_keys);
+                        local_devices = std::move(now_devices);
+                        local_keys = std::move(now_keys);
+                        have_local = true;
+                        g_log.write(L"信息", L"本地蓝牙状态已发布为基线");
+                        log_device_list(local_devices.root, L"当前已配对设备");
+                    }
+                } else if (!equal_key(local_devices.root, now_devices.root)
+                    || !equal_key(local_keys.root, now_keys.root)) {
+                    log_snapshot_diff(local_devices.root, now_devices.root, L"Devices");
+                    log_snapshot_diff(local_keys.root, now_keys.root, L"Keys");
+                    save_snapshot(devices_file, now_devices);
+                    save_snapshot(keys_file, now_keys);
+                    local_devices = std::move(now_devices);
+                    local_keys = std::move(now_keys);
+                    g_log.write(L"信息", L"稳定的本地蓝牙变化已发布，新增和删除均已镜像");
+                    log_device_list(local_devices.root, L"当前已配对设备");
+                } else if (!equal_key(now_devices.root, stored_devices.root)
+                    || !equal_key(now_keys.root, stored_keys.root)) {
+                    g_log.write(
+                        L"警告",
+                        L"持久化状态与本地状态不一致，按用户优先策略保留本地状态并记录冲突");
+                    log_device_list(now_devices.root, L"当前本地已配对设备");
+                    log_device_list(stored_devices.root, L"持久化设备记录");
+                }
+            } else {
+                g_log.write(L"调试", L"蓝牙快照不可用，不执行恢复或服务控制");
+            }
+        } else if (!radio_known || !radio_enabled) {
+            g_log.write(L"调试", L"蓝牙适配器不可用或已禁用，不自动启用或重启服务");
+        }
+
+        for (int i = 0; i < config.interval && !g_stop; ++i) {
+            std::this_thread::sleep_for(1s);
+        }
+    }
+
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    g_log.write(L"信息", L"服务工作线程已停止");
 }
 static void WINAPI service_control(DWORD code) { if (code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN) { g_stop = true; report_service(SERVICE_STOP_PENDING, NO_ERROR, 5000); } }
 static void WINAPI service_main(DWORD, LPWSTR*) { g_status_handle = RegisterServiceCtrlHandlerW(SERVICE_NAME, service_control); if (!g_status_handle) return; report_service(SERVICE_START_PENDING, NO_ERROR, 5000); std::thread thread(worker); report_service(SERVICE_RUNNING); thread.join(); report_service(SERVICE_STOPPED); }
