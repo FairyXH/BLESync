@@ -1,50 +1,180 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
-#include <bluetoothapis.h>
+#include <devguid.h>
+static const GUID BLE_DEVICE_CLASS_GUID = {0xe0cbf06c, 0xcd8b, 0x4647, {0xbb, 0x8a, 0x26, 0x3b, 0x43, 0xf0, 0xf9, 0x74}};
+#include <bcrypt.h>
 #include <sddl.h>
-#include <wincrypt.h>
-#include <shlobj.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <vector>
-#include <string>
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <atomic>
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
+#include <cstring>
+#include <iostream>
+#include <functional>
 #include "security.cpp"
 
-#pragma comment(lib, "advapi32.lib")
-namespace fs=std::filesystem; using namespace std::chrono_literals;
-static const wchar_t* SERVICE_NAME=L"BLESync"; static SERVICE_STATUS_HANDLE g_sh; static SERVICE_STATUS g_ss{}; static std::atomic<bool> g_stop=false;
-struct Config { fs::path exe, storage; int interval=5; std::wstring level=L"INFO"; };
-static std::wstring trim(std::wstring s){while(!s.empty()&&iswspace(s.front()))s.erase(s.begin());while(!s.empty()&&iswspace(s.back()))s.pop_back();return s;}
-static std::wstring lower(std::wstring s){std::transform(s.begin(),s.end(),s.begin(),towlower);return s;}
-static bool admin(){BOOL b=FALSE; PSID sid=nullptr; SID_IDENTIFIER_AUTHORITY a=SECURITY_NT_AUTHORITY; if(AllocateAndInitializeSid(&a,2,SECURITY_BUILTIN_DOMAIN_RID,DOMAIN_ALIAS_RID_ADMINS,0,0,0,0,0,0,&sid)) {CheckTokenMembership(nullptr,sid,&b);FreeSid(sid);} return b;}
-static fs::path module(){wchar_t b[32768];DWORD n=GetModuleFileNameW(nullptr,b,32768);return fs::path(std::wstring(b,n));}
-static Config load_config(){Config c; c.exe=module().parent_path(); std::wifstream f(c.exe/L"BLESync.ini"); f.imbue(std::locale("")); std::wstring l; while(std::getline(f,l)){l=trim(l);if(l.empty()||l[0]==L';'||l[0]==L'#'||l[0]==L'[')continue;auto p=l.find(L'=');if(p==std::wstring::npos)continue;auto k=lower(trim(l.substr(0,p))),v=trim(l.substr(p+1));if(k==L"storagepath")c.storage=fs::path(v);else if(k==L"scaninterval"){try{c.interval=std::max(1,std::stoi(v));}catch(...){}}else if(k==L"loglevel")c.level=v;}if(c.storage.empty())c.storage=c.exe/L"BLESyncData";return c;}
-class Log {std::mutex m;fs::path p;std::wstring level;public:void init(const Config&c){level=c.level;p=c.storage/L"logs"/L"BLESync.log";std::error_code e;fs::create_directories(p.parent_path(),e);}void put(const wchar_t*lv,const std::wstring&s){std::lock_guard<std::mutex>g(m);std::wofstream f(p,std::ios::app);f.imbue(std::locale(""));if(f){SYSTEMTIME t;GetLocalTime(&t);f<<L"["<<std::setfill(L'0')<<std::setw(2)<<t.wHour<<L":"<<std::setw(2)<<t.wMinute<<L":"<<std::setw(2)<<t.wSecond<<L"] ["<<lv<<L"] "<<s<<L"\n";}}} g_log;
-static std::wstring hex(const BYTE*d,DWORD n){std::wstringstream s;for(DWORD i=0;i<n;i++)s<<std::hex<<std::setw(2)<<std::setfill(L'0')<<(int)d[i];return s.str();}
-struct V {DWORD type=0;std::vector<BYTE> data;}; using Values=std::map<std::wstring,V>; struct K {std::wstring name;Values vals;std::vector<K> sub;};
-static bool read_tree(HKEY h,K&k){DWORD n=0,m=0;RegQueryInfoKeyW(h,nullptr,nullptr,nullptr,&n,&m,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr);for(DWORD i=0;i<m;i++){wchar_t name[512];DWORD nl=512,type=0,sz=0;if(RegEnumValueW(h,i,name,&nl,nullptr,&type,nullptr,&sz)!=ERROR_SUCCESS)continue;V v;v.type=type;v.data.resize(sz);nl=512;if(RegEnumValueW(h,i,name,&nl,nullptr,&v.type,v.data.data(),&sz)==ERROR_SUCCESS){v.data.resize(sz);k.vals[name]=std::move(v);}}for(DWORD i=0;i<n;i++){wchar_t name[512];DWORD nl=512;if(RegEnumKeyExW(h,i,name,&nl,nullptr,nullptr,nullptr,nullptr)!=ERROR_SUCCESS)continue;HKEY ch;if(RegOpenKeyExW(h,name,0,KEY_READ|KEY_WOW64_64KEY,&ch)!=ERROR_SUCCESS)continue;K q;q.name=name;read_tree(ch,q);RegCloseKey(ch);k.sub.push_back(std::move(q));}return true;}
-static void write_u32(std::ofstream&f,uint32_t x){f.write((char*)&x,4);}static bool read_u32(std::ifstream&f,uint32_t&x){return !!f.read((char*)&x,4);}static void ws(std::ofstream&f,const std::wstring&s){write_u32(f,(uint32_t)s.size());f.write((char*)s.data(),s.size()*2);}static bool rs(std::ifstream&f,std::wstring&s){uint32_t n;if(!read_u32(f,n)||n>100000)return false;s.resize(n);return !!f.read((char*)s.data(),n*2);}
-static void save_k(std::ofstream&f,const K&k){ws(f,k.name);write_u32(f,(uint32_t)k.vals.size());for(auto&[n,v]:k.vals){ws(f,n);write_u32(f,v.type);write_u32(f,(uint32_t)v.data.size());if(!v.data.empty())f.write((char*)v.data.data(),v.data.size());}write_u32(f,(uint32_t)k.sub.size());for(auto&q:k.sub)save_k(f,q);}
-static bool load_k(std::ifstream&f,K&k){uint32_t n; if(!rs(f,k.name)||!read_u32(f,n)||n>100000)return false; for(uint32_t i=0;i<n;i++){std::wstring name;V v;uint32_t type=0,size=0;if(!rs(f,name)||!read_u32(f,type)||!read_u32(f,size)||size>100000000)return false;v.type=type;v.data.resize(size);if(size&&!f.read((char*)v.data.data(),size))return false;k.vals[name]=std::move(v);}if(!read_u32(f,n)||n>100000)return false;for(uint32_t i=0;i<n;i++){K q;if(!load_k(f,q))return false;k.sub.push_back(std::move(q));}return true;}
-static bool snapshot(const Config&c,const wchar_t*root,const fs::path&out,K&tree){HKEY h;if(RegOpenKeyExW(HKEY_LOCAL_MACHINE,root,0,KEY_READ|KEY_WOW64_64KEY,&h)!=ERROR_SUCCESS)return false;tree.name=root;read_tree(h,tree);RegCloseKey(h);std::error_code e;fs::create_directories(out.parent_path(),e);auto tmp=out;tmp+=L".tmp";std::ofstream f(tmp,std::ios::binary|std::ios::trunc);if(!f)return false;f.write("BLESNAP1",8);write_u32(f,1);save_k(f,tree);f.flush();f.close();if(!MoveFileExW(tmp.c_str(),out.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){DeleteFileW(tmp.c_str());return false;}return true;}
-static bool load_snapshot(const fs::path&p,K&k){std::ifstream f(p,std::ios::binary);char h[8];uint32_t ver;if(!f.read(h,8)||memcmp(h,"BLESNAP1",8)||!read_u32(f,ver)||ver!=1)return false;return load_k(f,k);}
-static bool same(const K&a,const K&b){if(a.vals.size()!=b.vals.size()||a.sub.size()!=b.sub.size())return false;for(auto&[n,v]:a.vals){auto i=b.vals.find(n);if(i==b.vals.end()||v.type!=i->second.type||v.data!=i->second.data)return false;}for(size_t i=0;i<a.sub.size();i++)if(a.sub[i].name!=b.sub[i].name||!same(a.sub[i],b.sub[i]))return false;return true;}
-static bool radio(bool&known,bool&enabled){known=false;enabled=false;HBLUETOOTH_RADIO_FIND f;BLUETOOTH_FIND_RADIO_PARAMS p{sizeof(p)};HANDLE h=BluetoothFindFirstRadio(&p,&f);if(!h)return false;BLUETOOTH_RADIO_INFO i{};i.dwSize=sizeof(i);if(BluetoothGetRadioInfo(f,&i)==ERROR_SUCCESS){known=true;enabled=true;}BluetoothFindRadioClose(f);CloseHandle(h);return true;}
-static SERVICE_STATUS_PROCESS svcstat(const wchar_t*n){SERVICE_STATUS_PROCESS s{};SC_HANDLE m=OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);if(!m)return s;SC_HANDLE h=OpenServiceW(m,n,SERVICE_QUERY_STATUS);if(h){DWORD z;QueryServiceStatusEx(h,SC_STATUS_PROCESS_INFO,(LPBYTE)&s,sizeof(s),&z);CloseServiceHandle(h);}CloseServiceHandle(m);return s;}
-static bool install(){if(!admin())return false;Config c=load_config();SC_HANDLE m=OpenSCManagerW(nullptr,nullptr,SC_MANAGER_ALL_ACCESS);if(!m)return false;auto exe=(c.exe/L"BLESync.exe").wstring();SC_HANDLE s=OpenServiceW(m,SERVICE_NAME,SERVICE_ALL_ACCESS);if(!s)s=CreateServiceW(m,SERVICE_NAME,L"BLESync Bluetooth Persistence Service",SERVICE_ALL_ACCESS,SERVICE_WIN32_OWN_PROCESS,SERVICE_AUTO_START,SERVICE_ERROR_NORMAL,exe.c_str(),nullptr,nullptr,nullptr,L"LocalSystem",nullptr);if(!s){CloseServiceHandle(m);return false;}SERVICE_DELAYED_AUTO_START_INFO d{TRUE};ChangeServiceConfig2W(s,SERVICE_CONFIG_DELAYED_AUTO_START_INFO,&d);SC_ACTION a[3]={{SC_ACTION_RESTART,60000},{SC_ACTION_RESTART,120000},{SC_ACTION_RESTART,300000}};SERVICE_FAILURE_ACTIONSW fa{0, nullptr,nullptr,3,a};ChangeServiceConfig2W(s,SERVICE_CONFIG_FAILURE_ACTIONS,&fa);StartServiceW(s,0,nullptr);CloseServiceHandle(s);CloseServiceHandle(m);return true;}
-static bool uninstall(){if(!admin())return false;SC_HANDLE m=OpenSCManagerW(nullptr,nullptr,SC_MANAGER_ALL_ACCESS);if(!m)return false;SC_HANDLE s=OpenServiceW(m,SERVICE_NAME,SERVICE_STOP|DELETE|SERVICE_QUERY_STATUS);if(!s){CloseServiceHandle(m);return true;}SERVICE_STATUS st{};ControlService(s,SERVICE_CONTROL_STOP,&st);bool ok=DeleteService(s);CloseServiceHandle(s);CloseServiceHandle(m);return ok;}
-static void report(DWORD st,DWORD win=NO_ERROR,DWORD hint=0){g_ss.dwServiceType=SERVICE_WIN32_OWN_PROCESS;g_ss.dwCurrentState=st;g_ss.dwControlsAccepted=(st==SERVICE_RUNNING)?SERVICE_ACCEPT_STOP|SERVICE_ACCEPT_SHUTDOWN:0;g_ss.dwWin32ExitCode=win;g_ss.dwWaitHint=hint;SetServiceStatus(g_sh,&g_ss);}
-static void worker(){Config c=load_config();g_log.init(c);std::error_code e;fs::create_directories(c.storage/L"registry",e);if(e){g_log.put(L"ERROR",L"Storage directory creation failed");return;}ProtectStorage(c.storage);g_log.put(L"INFO",L"Service worker started");K last;bool have=false;auto path=c.storage/L"registry"/L"devices.regdata";while(!g_stop){auto ss=svcstat(L"bthserv");bool known=false,en=false;radio(known,en);if(ss.dwCurrentState==SERVICE_START_PENDING||ss.dwCurrentState==SERVICE_STOP_PENDING){g_log.put(L"DEBUG",L"Bluetooth service pending; deferring synchronization");}else if(ss.dwCurrentState==SERVICE_RUNNING&&known&&en){K cur;if(snapshot(c,L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices",path,cur)){if(!have){last=cur;have=true;g_log.put(L"INFO",L"Initial Bluetooth registry snapshot captured");}else if(!same(last,cur)){last=cur;g_log.put(L"INFO",L"Bluetooth registry snapshot changed; persistent snapshot updated");}}}else if(!known||!en)g_log.put(L"DEBUG",L"Bluetooth radio unavailable or disabled; no restore or service control");for(int i=0;i<c.interval&&!g_stop;i++)std::this_thread::sleep_for(1s);}g_log.put(L"INFO",L"Service worker stopped");}
-static void WINAPI ctrl(DWORD c){if(c==SERVICE_CONTROL_STOP||c==SERVICE_CONTROL_SHUTDOWN){g_stop=true;report(SERVICE_STOP_PENDING,NO_ERROR,5000);}}
-static void WINAPI main_svc(DWORD,LPWSTR*){g_sh=RegisterServiceCtrlHandlerW(SERVICE_NAME,ctrl);if(!g_sh)return;report(SERVICE_START_PENDING,NO_ERROR,5000);std::thread t(worker);report(SERVICE_RUNNING);t.join();report(SERVICE_STOPPED);}
-int wmain(int argc,wchar_t**argv){if(argc>1){auto a=lower(argv[1]);if(a==L"--install")return install()?0:1;if(a==L"--uninstall")return uninstall()?0:1;if(a==L"--console"){worker();return 0;}if(a==L"--capture"){Config c=load_config();K k;return snapshot(c,L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices",c.storage/L"registry"/L"devices.regdata",k)?0:1;}}SERVICE_TABLE_ENTRYW t[]={{const_cast<LPWSTR>(SERVICE_NAME),main_svc},{nullptr,nullptr}};if(!StartServiceCtrlDispatcherW(t))return GetLastError()==ERROR_FAILED_SERVICE_CONTROLLER_CONNECT? (worker(),0):1;return 0;}
+namespace fs = std::filesystem;
+using namespace std::chrono_literals;
+
+static constexpr wchar_t SERVICE_NAME[] = L"BLESync";
+static constexpr wchar_t DEV_ROOT[] = L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices";
+static constexpr wchar_t KEY_ROOT[] = L"SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Keys";
+static std::atomic<bool> g_stop{false};
+static SERVICE_STATUS_HANDLE g_status_handle = nullptr;
+static SERVICE_STATUS g_status{};
+
+struct Config { fs::path exe_dir, storage; int interval = 5; std::wstring log_level = L"INFO"; };
+struct Value { DWORD type = REG_NONE; std::vector<BYTE> data; };
+struct Key { std::wstring name; std::map<std::wstring, Value> values; std::map<std::wstring, Key> children; };
+struct Snapshot { Key root; std::wstring hash; uint64_t bytes = 0; };
+
+static std::wstring trim(std::wstring s) { while (!s.empty() && iswspace(s.front())) s.erase(s.begin()); while (!s.empty() && iswspace(s.back())) s.pop_back(); return s; }
+static std::wstring lower(std::wstring s) { std::transform(s.begin(), s.end(), s.begin(), towlower); return s; }
+static std::wstring upper(std::wstring s) { std::transform(s.begin(), s.end(), s.begin(), towupper); return s; }
+static fs::path module_dir() { wchar_t b[32768]{}; DWORD n = GetModuleFileNameW(nullptr, b, 32768); return fs::path(std::wstring(b, n)).parent_path(); }
+
+static Config load_config() {
+    Config c; c.exe_dir = module_dir(); const auto ini = (c.exe_dir / L"BLESync.ini").wstring(); wchar_t buffer[32768]{};
+    GetPrivateProfileStringW(L"BLESync", L"StoragePath", L"", buffer, 32768, ini.c_str()); c.storage = fs::path(buffer);
+    GetPrivateProfileStringW(L"BLESync", L"LogLevel", L"INFO", buffer, 32768, ini.c_str()); c.log_level = upper(buffer);
+    GetPrivateProfileStringW(L"BLESync", L"ScanInterval", L"5", buffer, 32768, ini.c_str()); try { c.interval = std::max(1, std::stoi(buffer)); } catch (...) { c.interval = 5; }
+    if (c.storage.empty()) { c.storage = c.exe_dir / L"BLESyncData"; }
+    return c;
+}
+
+static std::wstring utf8_to_wide(const std::string& value) { if (value.empty()) return L""; int n = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0); std::wstring result(n, L'\0'); MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), n); return result; }
+static std::string wide_to_utf8(const std::wstring& value) { if (value.empty()) return {}; int n = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr); std::string result(n, '\0'); WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), n, nullptr, nullptr); return result; }
+
+static std::wstring format_message(const wchar_t* level, const std::wstring& message) { SYSTEMTIME t{}; GetLocalTime(&t); std::wstringstream out; out << L"[" << std::setfill(L'0') << std::setw(2) << t.wHour << L":" << std::setw(2) << t.wMinute << L":" << std::setw(2) << t.wSecond << L"] [" << level << L"] " << message; return out.str(); }
+
+class Logger {
+    std::mutex mutex_; fs::path path_;
+public:
+    void init(const Config& c) { path_ = c.storage / L"logs" / L"BLESync.log"; std::error_code e; fs::create_directories(path_.parent_path(), e); }
+    void write(const wchar_t* level, const std::wstring& message) {
+        std::lock_guard<std::mutex> lock(mutex_); const auto line = wide_to_utf8(format_message(level, message)) + "\r\n"; HANDLE h = CreateFileW(path_.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (h == INVALID_HANDLE_VALUE) return; DWORD written = 0; WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr); CloseHandle(h);
+    }
+};
+static Logger g_log;
+
+static bool is_admin() {
+    BOOL result = FALSE; PSID sid = nullptr; SID_IDENTIFIER_AUTHORITY auth = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&auth, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &sid)) { CheckTokenMembership(nullptr, sid, &result); FreeSid(sid); }
+    return result != FALSE;
+}
+
+static bool protect_storage(const fs::path& path) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) return false;
+    std::error_code e; fs::create_directories(path, e); const bool ok = !e && SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, sd) != FALSE; LocalFree(sd); return ok;
+}
+
+static void u32(std::ostream& out, uint32_t value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
+static bool ru32(std::istream& in, uint32_t& value) { return static_cast<bool>(in.read(reinterpret_cast<char*>(&value), sizeof(value))); }
+static void text(std::ostream& out, const std::wstring& value) { u32(out, static_cast<uint32_t>(value.size())); out.write(reinterpret_cast<const char*>(value.data()), value.size() * sizeof(wchar_t)); }
+static bool rtext(std::istream& in, std::wstring& value) { uint32_t n = 0; if (!ru32(in, n) || n > 1000000) return false; value.resize(n); return static_cast<bool>(in.read(reinterpret_cast<char*>(value.data()), n * sizeof(wchar_t))); }
+static void encode_key(std::ostream& out, const Key& key) { text(out, key.name); u32(out, static_cast<uint32_t>(key.values.size())); for (const auto& [name, val] : key.values) { text(out, name); u32(out, val.type); u32(out, static_cast<uint32_t>(val.data.size())); if (!val.data.empty()) out.write(reinterpret_cast<const char*>(val.data.data()), val.data.size()); } u32(out, static_cast<uint32_t>(key.children.size())); for (const auto& [_, child] : key.children) encode_key(out, child); }
+static bool decode_key(std::istream& in, Key& key) { uint32_t n = 0; if (!rtext(in, key.name) || !ru32(in, n) || n > 100000) return false; for (uint32_t i = 0; i < n; ++i) { std::wstring name; Value value; uint32_t type = 0, size = 0; if (!rtext(in, name) || !ru32(in, type) || !ru32(in, size) || size > 128 * 1024 * 1024) return false; value.type = type; value.data.resize(size); if (size && !in.read(reinterpret_cast<char*>(value.data.data()), size)) return false; key.values.emplace(std::move(name), std::move(value)); } if (!ru32(in, n) || n > 100000) return false; for (uint32_t i = 0; i < n; ++i) { Key child; if (!decode_key(in, child)) return false; key.children.emplace(child.name, std::move(child)); } return true; }
+
+static std::wstring sha256(const std::vector<BYTE>& data) {
+    BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_HASH_HANDLE hash = nullptr; DWORD object_size = 0, result = 0;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0 || BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size), &result, 0) != 0) { if (alg) BCryptCloseAlgorithmProvider(alg, 0); return L""; }
+    std::vector<BYTE> object(object_size), digest(32); if (BCryptCreateHash(alg, &hash, object.data(), object.size(), nullptr, 0, 0) != 0 || BCryptHashData(hash, const_cast<PUCHAR>(data.data()), static_cast<ULONG>(data.size()), 0) != 0 || BCryptFinishHash(hash, digest.data(), digest.size(), 0) != 0) { if (hash) BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(alg, 0); return L""; }
+    BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(alg, 0); std::wstringstream out; for (BYTE b : digest) out << std::hex << std::setw(2) << std::setfill(L'0') << static_cast<unsigned>(b); return out.str();
+}
+
+static bool capture_registry(const wchar_t* root, Snapshot& snap) {
+    HKEY handle = nullptr; if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, root, 0, KEY_READ | KEY_WOW64_64KEY, &handle) != ERROR_SUCCESS) return false;
+    snap.root = {}; snap.root.name = root;
+    std::function<bool(HKEY, Key&)> read = [&](HKEY h, Key& key) {
+        DWORD subkeys = 0, values = 0; if (RegQueryInfoKeyW(h, nullptr, nullptr, nullptr, &subkeys, nullptr, nullptr, &values, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) return false;
+        for (DWORD i = 0; i < values; ++i) { wchar_t name[1024]{}; DWORD name_len = 1024, type = 0, size = 0; if (RegEnumValueW(h, i, name, &name_len, nullptr, &type, nullptr, &size) != ERROR_SUCCESS) continue; Value v; v.type = type; v.data.resize(size); name_len = 1024; if (RegEnumValueW(h, i, name, &name_len, nullptr, &v.type, v.data.data(), &size) == ERROR_SUCCESS) { v.data.resize(size); key.values.emplace(name, std::move(v)); } }
+        for (DWORD i = 0; i < subkeys; ++i) { wchar_t name[1024]{}; DWORD len = 1024; if (RegEnumKeyExW(h, i, name, &len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) continue; HKEY child_handle = nullptr; if (RegOpenKeyExW(h, name, 0, KEY_READ | KEY_WOW64_64KEY, &child_handle) != ERROR_SUCCESS) continue; Key child; child.name = name; const bool ok = read(child_handle, child); RegCloseKey(child_handle); if (!ok) return false; key.children.emplace(child.name, std::move(child)); }
+        return true;
+    };
+    const bool ok = read(handle, snap.root); RegCloseKey(handle); return ok;
+}
+
+static bool serialize_snapshot(const Snapshot& snap, std::vector<BYTE>& payload) { std::ostringstream out(std::ios::binary); out.write("BLESNAP2", 8); u32(out, 2); encode_key(out, snap.root); const auto value = out.str(); payload.assign(value.begin(), value.end()); return true; }
+static bool save_snapshot(const fs::path& path, const Snapshot& snap) {
+    std::vector<BYTE> payload; if (!serialize_snapshot(snap, payload)) return false; const auto hash = sha256(payload); const fs::path temp = path.wstring() + L".tmp"; const fs::path backup = path.wstring() + L".backup"; std::error_code e; fs::create_directories(path.parent_path(), e); if (e) return false;
+    HANDLE h = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (h == INVALID_HANDLE_VALUE) return false; DWORD written = 0; const bool wrote = WriteFile(h, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) && written == payload.size() && FlushFileBuffers(h); CloseHandle(h); if (!wrote) { DeleteFileW(temp.c_str()); return false; }
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (!MoveFileExW(path.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return false;
+    }
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileW(temp.c_str()); return false; }
+    std::error_code state_error; fs::create_directories(path.parent_path().parent_path() / L"state", state_error);
+    const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos; const std::wstring meta_key = is_keys ? L"KeysHash" : L"DevicesHash"; wchar_t other[256]{}; const std::wstring other_key = is_keys ? L"DevicesHash" : L"KeysHash"; const auto meta_path = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring(); GetPrivateProfileStringW(L"Meta", other_key.c_str(), L"", other, 256, meta_path.c_str());
+    std::string meta_text = "[Meta]\r\n" + wide_to_utf8(meta_key) + "=" + wide_to_utf8(hash) + "\r\n" + wide_to_utf8(other_key) + "=" + wide_to_utf8(other) + "\r\nBytes=" + std::to_string(payload.size()) + "\r\nUpdatedTick=" + std::to_string(GetTickCount64()) + "\r\n";
+    HANDLE mh = CreateFileW((path.parent_path().parent_path() / L"state" / L"metadata.ini").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (mh != INVALID_HANDLE_VALUE) { DWORD written = 0; WriteFile(mh, meta_text.data(), static_cast<DWORD>(meta_text.size()), &written, nullptr); FlushFileBuffers(mh); CloseHandle(mh); }
+    return true;
+}
+static bool load_snapshot(const fs::path& path, Snapshot& snap) { std::ifstream in(path, std::ios::binary); if (!in) return false; std::vector<BYTE> payload((std::istreambuf_iterator<char>(in)), {}); if (payload.size() < 12 || std::memcmp(payload.data(), "BLESNAP2", 8) != 0) return false; uint32_t version = 0; std::istringstream data(std::string(payload.begin(), payload.end()), std::ios::binary); char magic[8]; data.read(magic, 8); if (!ru32(data, version) || version != 2 || !decode_key(data, snap.root)) return false; snap.hash = sha256(payload); snap.bytes = payload.size(); if (snap.hash.empty()) return false; wchar_t expected[256]{}; const auto ini = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring(); const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos; const wchar_t* hash_key = is_keys ? L"KeysHash" : L"DevicesHash"; GetPrivateProfileStringW(L"Meta", hash_key, L"", expected, 256, ini.c_str()); return expected[0] != L'\0' && snap.hash == expected; }
+static bool equal_key(const Key& a, const Key& b) { if (a.values.size() != b.values.size() || a.children.size() != b.children.size()) return false; for (const auto& [n, v] : a.values) { auto it = b.values.find(n); if (it == b.values.end() || v.type != it->second.type || v.data != it->second.data) return false; } for (const auto& [n, c] : a.children) { auto it = b.children.find(n); if (it == b.children.end() || !equal_key(c, it->second)) return false; } return true; }
+
+static bool apply_key(HKEY parent, const Key& desired, bool allow_delete) {
+    HKEY h = nullptr; if (RegCreateKeyExW(parent, desired.name.c_str(), 0, nullptr, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, nullptr, &h, nullptr) != ERROR_SUCCESS) return false;
+    DWORD value_count = 0; RegQueryInfoKeyW(h, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &value_count, nullptr, nullptr, nullptr, nullptr); std::set<std::wstring> current_values;
+    for (DWORD i = 0; i < value_count; ++i) { wchar_t name[1024]{}; DWORD len = 1024; if (RegEnumValueW(h, i, name, &len, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) current_values.emplace(name); }
+    for (const auto& [name, value] : desired.values) { if (RegSetValueExW(h, name.c_str(), 0, value.type, value.data.data(), static_cast<DWORD>(value.data.size())) != ERROR_SUCCESS) { RegCloseKey(h); return false; } current_values.erase(name); }
+    if (allow_delete) for (const auto& name : current_values) RegDeleteValueW(h, name.c_str());
+    DWORD subkeys = 0; RegQueryInfoKeyW(h, nullptr, nullptr, nullptr, &subkeys, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr); std::set<std::wstring> current_children;
+    for (DWORD i = 0; i < subkeys; ++i) { wchar_t name[1024]{}; DWORD len = 1024; if (RegEnumKeyExW(h, i, name, &len, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) current_children.emplace(name); }
+    for (const auto& [name, child] : desired.children) { if (!apply_key(h, child, allow_delete)) { RegCloseKey(h); return false; } current_children.erase(name); }
+    if (allow_delete) { for (const auto& name : current_children) RegDeleteTreeW(h, name.c_str()); }
+    RegCloseKey(h); return true;
+}
+static bool restore_registry(const wchar_t* root, const Snapshot& snap) { HKEY h = nullptr; if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, root, 0, nullptr, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, nullptr, &h, nullptr) != ERROR_SUCCESS) return false; bool ok = true; for (const auto& [name, child] : snap.root.children) ok = ok && apply_key(h, child, true); RegCloseKey(h); return ok; }
+
+static SERVICE_STATUS_PROCESS service_state(const wchar_t* name) { SERVICE_STATUS_PROCESS result{}; SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT); if (!manager) return result; SC_HANDLE service = OpenServiceW(manager, name, SERVICE_QUERY_STATUS); if (service) { DWORD bytes = 0; QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&result), sizeof(result), &bytes); CloseServiceHandle(service); } CloseServiceHandle(manager); return result; }
+static bool radio_state(bool& known, bool& enabled) { known = false; enabled = false; HDEVINFO info = SetupDiGetClassDevsW(&BLE_DEVICE_CLASS_GUID, nullptr, nullptr, DIGCF_PRESENT); if (info == INVALID_HANDLE_VALUE) return false; SP_DEVINFO_DATA data{}; data.cbSize = sizeof(data); for (DWORD i = 0; SetupDiEnumDeviceInfo(info, i, &data); ++i) { DWORD status = 0, problem = 0; if (CM_Get_DevNode_Status(&status, &problem, data.DevInst, 0) == CR_SUCCESS) { known = true; enabled = (status & DN_STARTED) != 0 && problem == 0; break; } } SetupDiDestroyDeviceInfoList(info); return known; }
+static void report_service(DWORD state, DWORD error = NO_ERROR, DWORD hint = 0) { g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS; g_status.dwCurrentState = state; g_status.dwControlsAccepted = state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0; g_status.dwWin32ExitCode = error; g_status.dwWaitHint = hint; SetServiceStatus(g_status_handle, &g_status); }
+
+static bool install_service() { if (!is_admin()) return false; const Config c = load_config(); SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS); if (!manager) return false; const auto exe = (c.exe_dir / L"BLESync.exe").wstring(); SC_HANDLE service = OpenServiceW(manager, SERVICE_NAME, SERVICE_ALL_ACCESS); if (!service) service = CreateServiceW(manager, SERVICE_NAME, L"BLESync Bluetooth Persistence Service", SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, exe.c_str(), nullptr, nullptr, nullptr, L"LocalSystem", nullptr); if (!service) { CloseServiceHandle(manager); return false; } SERVICE_DELAYED_AUTO_START_INFO delayed{TRUE}; ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed); SC_ACTION actions[3]{{SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 120000}, {SC_ACTION_RESTART, 300000}}; SERVICE_FAILURE_ACTIONSW failure{}; failure.cActions = 3; failure.lpsaActions = actions; ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure); const bool started = StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING; CloseServiceHandle(service); CloseServiceHandle(manager); return started; }
+static bool uninstall_service() { if (!is_admin()) return false; SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS); if (!manager) return false; SC_HANDLE service = OpenServiceW(manager, SERVICE_NAME, SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE); if (!service) { CloseServiceHandle(manager); return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST; } SERVICE_STATUS status{}; ControlService(service, SERVICE_CONTROL_STOP, &status); const bool ok = DeleteService(service) != FALSE; CloseServiceHandle(service); CloseServiceHandle(manager); return ok; }
+
+static void worker() {
+    const Config c = load_config(); g_log.init(c); std::error_code e; fs::create_directories(c.storage / L"registry", e); if (e || !protect_storage(c.storage)) { g_log.write(L"ERROR", L"Storage initialization or ACL failed"); return; }
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Global\\BLESync.StorageLock"); if (!mutex) { g_log.write(L"ERROR", L"Cannot create storage mutex"); return; }
+    const DWORD lock_result = WaitForSingleObject(mutex, 2000); if (lock_result != WAIT_OBJECT_0 && lock_result != WAIT_ABANDONED) { g_log.write(L"ERROR", L"Storage mutex timeout; worker stopped safely"); CloseHandle(mutex); return; }
+    g_log.write(L"INFO", L"Service worker started"); bool have_local = false; Snapshot local_devices, local_keys; const fs::path devices_file = c.storage / L"registry" / L"devices.regdata", keys_file = c.storage / L"registry" / L"keys.regdata";
+    while (!g_stop) {
+        const auto service = service_state(L"bthserv"); bool radio_known = false, radio_enabled = false; radio_state(radio_known, radio_enabled);
+        if (service.dwCurrentState == SERVICE_START_PENDING || service.dwCurrentState == SERVICE_STOP_PENDING) g_log.write(L"DEBUG", L"Bluetooth service pending; synchronization deferred");
+        else if (service.dwCurrentState == SERVICE_RUNNING && radio_known && radio_enabled) {
+            Snapshot now_devices, now_keys; const bool got_devices = capture_registry(DEV_ROOT, now_devices); const bool got_keys = capture_registry(KEY_ROOT, now_keys);
+            if (got_devices && got_keys) {
+                Snapshot stored_devices, stored_keys; const bool has_stored = load_snapshot(devices_file, stored_devices) && load_snapshot(keys_file, stored_keys);
+                if (!has_stored || !have_local) {
+                    if (has_stored && !have_local && restore_registry(DEV_ROOT, stored_devices) && restore_registry(KEY_ROOT, stored_keys)) {
+                        Snapshot restored_devices, restored_keys; if (capture_registry(DEV_ROOT, restored_devices) && capture_registry(KEY_ROOT, restored_keys)) { local_devices = std::move(restored_devices); local_keys = std::move(restored_keys); have_local = true; g_log.write(L"INFO", L"Valid persistent Bluetooth state restored and verified"); }
+                    } else {
+                        save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); have_local = true; g_log.write(L"INFO", L"Local Bluetooth state published as baseline");
+                    }
+                }
+                else if (!equal_key(local_devices.root, now_devices.root) || !equal_key(local_keys.root, now_keys.root)) { save_snapshot(devices_file, now_devices); save_snapshot(keys_file, now_keys); local_devices = std::move(now_devices); local_keys = std::move(now_keys); g_log.write(L"INFO", L"Stable local Bluetooth change published; additions and deletions mirrored"); }
+                else if (!equal_key(now_devices.root, stored_devices.root) || !equal_key(now_keys.root, stored_keys.root)) g_log.write(L"WARN", L"Persistent state differs from local state; user-first policy keeps local state and records conflict");
+            } else g_log.write(L"DEBUG", L"Bluetooth snapshot unavailable; no restore or service control");
+        } else if (!radio_known || !radio_enabled) g_log.write(L"DEBUG", L"Bluetooth radio unavailable or disabled; no automatic enable or restart");
+        for (int i = 0; i < c.interval && !g_stop; ++i) std::this_thread::sleep_for(1s);
+    }
+    ReleaseMutex(mutex); CloseHandle(mutex); g_log.write(L"INFO", L"Service worker stopped");
+}
+static void WINAPI service_control(DWORD code) { if (code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN) { g_stop = true; report_service(SERVICE_STOP_PENDING, NO_ERROR, 5000); } }
+static void WINAPI service_main(DWORD, LPWSTR*) { g_status_handle = RegisterServiceCtrlHandlerW(SERVICE_NAME, service_control); if (!g_status_handle) return; report_service(SERVICE_START_PENDING, NO_ERROR, 5000); std::thread thread(worker); report_service(SERVICE_RUNNING); thread.join(); report_service(SERVICE_STOPPED); }
+
+int wmain(int argc, wchar_t** argv) {
+    if (argc > 1) { const auto arg = lower(argv[1]); if (arg == L"--install") return install_service() ? 0 : 1; if (arg == L"--uninstall") return uninstall_service() ? 0 : 1; if (arg == L"--console") { worker(); return 0; } if (arg == L"--capture") { const Config c = load_config(); Snapshot d, k; return capture_registry(DEV_ROOT, d) && capture_registry(KEY_ROOT, k) && save_snapshot(c.storage / L"registry" / L"devices.regdata", d) && save_snapshot(c.storage / L"registry" / L"keys.regdata", k) ? 0 : 1; } if (arg == L"--status") { const auto s = service_state(L"bthserv"); bool known = false, enabled = false; radio_state(known, enabled); std::wcout << L"bthserv=" << s.dwCurrentState << L" radio_known=" << known << L" radio_enabled=" << enabled << L"\n"; return 0; } return 2; }
+    SERVICE_TABLE_ENTRYW table[] = {{const_cast<LPWSTR>(SERVICE_NAME), service_main}, {nullptr, nullptr}}; if (!StartServiceCtrlDispatcherW(table)) { if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) { worker(); return 0; } return 1; } return 0;
+}

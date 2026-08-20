@@ -1,58 +1,173 @@
-# BLESync Design
+# BLESync 设计说明
 
-## Architecture
+## 目标和边界
 
-The executable has two modes:
+BLESync 不重定向整个 Windows Registry Hive，也不替换 `SYSTEM` 文件。它以 Windows 服务方式运行，只处理经过明确选择的 Bluetooth Port 注册表分支。
 
-1. Controller mode: resolves its own directory, reads the adjacent INI, requests elevation when needed, creates/updates the `BLESync` service, configures delayed auto-start and bounded recovery, starts the service, then exits.
-2. Service mode: registers with SCM, reports state transitions, starts a worker, and shuts down through the service control handler.
+目标是持久化蓝牙配对身份和相关认证材料，而不是复制所有 Windows PnP 生成数据。`Enum\BTH`、`Enum\BTHENUM`、`Control\DeviceClasses` 仍由 Windows 当前安装生成，不进行机械复制。
 
-Core modules are separated into configuration, logging, security/ACL, registry traversal, Bluetooth state detection, snapshot serialization, synchronization policy, and SCM integration.
+## 架构
 
-## Registry model
+程序分为两种模式：
 
-A snapshot is a typed recursive tree of keys and values. It supports `REG_SZ`, `REG_EXPAND_SZ`, `REG_BINARY`, `REG_DWORD`, `REG_QWORD`, and `REG_MULTI_SZ`. Registry view is explicitly 64-bit on a 64-bit OS. Snapshot files contain a version, schema, source path, item counts, and content digest. Sensitive key payloads are only handled by the LocalSystem service and are redacted from logs.
+1. 控制器模式：定位 EXE 所在目录，读取同目录 INI，创建或更新服务，配置 LocalSystem、延迟启动和失败恢复，然后启动服务并退出。
+2. 服务模式：通过 SCM 注册服务入口，运行工作线程，响应停止和关机控制码。
 
-The first implementation treats `BTHPORT\\Parameters\\Devices` and `BTHPORT\\Parameters\\Keys` as the primary state. PnP-generated `Enum` and interface trees are observed for diagnostics but are not mechanically replicated because device instance IDs, containers, interfaces, and driver state are installation-specific.
+核心职责包括：
 
-## Lifecycle and state machine
+- 配置解析
+- 文件日志
+- Storage ACL
+- Registry 递归读取
+- Registry 递归写回
+- 快照序列化和校验
+- Bluetooth PnP 状态检测
+- Bluetooth 服务状态检测
+- 周期同步
 
-The worker transitions through:
+## Registry 快照
 
-`INITIALIZING -> WAITING_FOR_BLUETOOTH -> BLUETOOTH_DISABLED | BLUETOOTH_ENABLING | BLUETOOTH_ACTIVE -> MONITORING`
+快照树由以下对象组成：
 
-A synchronization operation temporarily enters `SYNCING` or `RESTORING`. `UNKNOWN`, `PAIRING`, and service pending states are conservative gates: no restore and no service control.
+```text
+Key
+├─ name
+├─ values[name] = {type, binary data}
+└─ children[name] = Key
+```
 
-Service state is read with SCM `QueryServiceStatusEx`. Adapter/radio state is read independently using SetupAPI, Configuration Manager, and Bluetooth radio APIs. `bthserv == RUNNING` is never treated as equivalent to an enabled radio.
+支持 `REG_SZ`、`REG_EXPAND_SZ`、`REG_BINARY`、`REG_DWORD`、`REG_QWORD`、`REG_MULTI_SZ` 等 Registry value 类型，因为数据按类型和原始字节保存。
 
-## User-first synchronization
+快照格式包含：
 
-The central ambiguity is whether a local/storage difference came from user intent or from a previous restore. The worker maintains:
+```text
+BLESNAP2
+FormatVersion=2
+RecursiveKeyTree
+```
 
-- local snapshot hash and generation;
-- storage metadata version, origin ID, timestamp, and hash;
-- expected post-restore hash;
-- restore generation and a bounded verification deadline;
-- last stable local hash and observation time.
+保存时先生成 `.tmp` 文件，写入并调用 `FlushFileBuffers`，然后保留 `.backup` 并使用 `MoveFileExW` 原子替换目标文件。
 
-A stable local change observed outside the restore verification window is published as the new user state. A storage update is restored only if local Bluetooth is enabled and stable, no local change is pending, and the storage version is newer than the last applied version. This prevents a pairing or removal action from being immediately overwritten.
+## 完整性校验
 
-If both systems publish against the same base version, the service records a conflict and applies the configured conservative winner: the most recently observed stable snapshot only when the other writer has not advanced the version; otherwise it preserves the current local state and waits for the next stable convergence event. Secrets are not included in conflict logs.
+快照载荷通过 Windows CNG `BCrypt*` API 计算 SHA-256。`state\metadata.ini` 记录：
 
-## Restore safety
+```ini
+[Meta]
+Hash=...
+Bytes=...
+UpdatedTick=...
+```
 
-No destructive whole-hive import exists. Restore is key/value-level and limited to the approved BTHPORT roots. Missing values and subkeys are deleted only when the operation is explicitly classified as an approved mirror update; generated PnP trees are never deleted. Restore is skipped for disabled/unknown/pending states and on invalid or partially written storage.
+读取快照时会重新计算当前载荷摘要；格式损坏或摘要无法计算时拒绝使用。当前实现已经记录摘要，但后续还应把元数据摘要比对作为单独的拒绝条件，避免只验证二进制格式而不验证外部元数据。
 
-The service never uses `reg.exe`, `net stop`, or periodic `sc stop/start`. A Bluetooth service restart is not part of the normal algorithm. If a future diagnostic feature proves a refresh is required, it must add a separate guarded operation with explicit state, pairing-activity checks, and an audit record.
+## 同步算法
 
-## Atomic persistence and integrity
+服务维护当前已确认的本地快照：
 
-Writers serialize through a named mutex. The payload is written to `*.tmp`, flushed, optionally backed up, and replaced. Metadata is committed after payload validation. On startup, invalid or mismatched data is rejected and the current registry is preserved. A previous backup remains available for recovery.
+```text
+local_devices
+local_keys
+have_local
+```
 
-## Service security
+每轮扫描：
 
-The service runs as LocalSystem because `BTHPORT\\Parameters\\Keys` is protected. The program does not modify the registry's existing permissions. Storage ACLs grant access only to LocalSystem and administrators. Configuration is not treated as a secret; key payloads are.
+1. 查询 `bthserv` 状态。
+2. 查询 Bluetooth 类 PnP 设备是否存在以及是否 `DN_STARTED`。
+3. 如果服务处于 Pending，等待。
+4. 如果 Radio 未知或未启用，不执行自动恢复。
+5. 读取 Devices 和 Keys。
+6. 如果没有有效 Storage 快照：发布当前本地快照作为基线。
+7. 如果有 Storage 快照但本进程尚未建立本地基线：尝试恢复两个目标分支，再重新读取验证。
+8. 如果本地快照相对上轮发生变化：视为用户在当前系统进行了增加或删除，发布本地状态。
+9. 如果 Storage 与本地都稳定但不一致：记录冲突并保留本地状态。
 
-## Verification boundaries
+这种策略优先保护用户刚刚执行的配对、删除和开关操作，不使用“Storage 总是覆盖本地”的暴力策略。
 
-A build can verify source-level behavior, service registration, state detection, snapshot round trips, atomic writes, ACL application, and no-service-restart policy. It cannot prove cross-install Bluetooth pairing compatibility without two controlled Windows installations and a known adapter. The lab protocol is documented in `docs\\BluetoothRegistryAnalysis.md`.
+## 删除同步
+
+Registry 镜像写回使用递归比较：
+
+- Snapshot 中存在的 value 使用 `RegSetValueExW` 写入。
+- Snapshot 中不存在的 value 使用 `RegDeleteValueW` 删除。
+- Snapshot 中存在的子键递归处理。
+- Snapshot 中不存在的子键使用 `RegDeleteTreeW` 删除。
+
+该逻辑只允许用于明确批准的 BTHPORT 分支，不能用于 `Enum` 或 `DeviceClasses`。
+
+## 蓝牙状态门控
+
+服务状态和适配器状态分开处理：
+
+```text
+BluetoothServiceState：SCM 查询结果
+BluetoothAdapterState：SetupAPI/CM_Get_DevNode_Status
+BluetoothDeviceState：Devices/Keys 快照
+```
+
+`bthserv == RUNNING` 不等于蓝牙适配器已启用。当前实现使用 Bluetooth 设备类的 SetupAPI 枚举和 `DN_STARTED`、Problem Code 作为适配器门控。
+
+未知状态的策略是：
+
+```text
+不恢复
+不启动蓝牙
+不重启 bthserv
+等待下一轮
+```
+
+## 用户操作优先
+
+BLESync 不拦截 Windows 蓝牙服务启动，也不 Hook Service Control Manager。用户在设置中打开或关闭蓝牙时，服务只观察状态变化并延迟同步。
+
+用户主动配对新设备后，本地 Registry 变化会被识别为本地稳定变化并发布。用户主动删除设备后，本地缺失同样会发布，从而允许删除传播到共享 Storage。
+
+## 并发和超时
+
+两个 Windows 可能同时写入同一个目录。服务使用：
+
+```text
+Global\BLESync.StorageLock
+```
+
+保护 Storage。获取锁最多等待 2 秒；超时则记录错误并退出本次服务工作线程，避免死锁。文件写入也使用共享读写策略和原子替换。
+
+当前版本采用保守冲突策略：发现 Storage 与本地稳定状态不一致时不静默覆盖本地，而是记录摘要并继续观察。生产版本还应增加实例 ID、单调版本号、基线版本和显式冲突文件，以支持两个系统的可审计合并。
+
+## 服务恢复
+
+服务配置：
+
+```text
+账户：LocalSystem
+启动：SERVICE_AUTO_START
+延迟启动：启用
+失败恢复：1 分钟、2 分钟、5 分钟后重启
+```
+
+服务自身不会在扫描周期中调用 `StartService` 或 `ControlService` 控制 `bthserv`。
+
+## 验证边界
+
+当前系统可验证：
+
+- MinGW 编译
+- CLI 参数
+- 服务注册和启动
+- LocalSystem 账户
+- 延迟自动启动
+- Storage ACL
+- Devices/Keys 读取
+- 快照文件和备份
+- 日志
+- 无周期性蓝牙服务重启
+
+当前系统无法单机证明：
+
+- 新设备真实配对后跨系统恢复
+- 删除设备后的第二系统同步
+- 重启 Windows 后 Windows Bluetooth Stack 是否接受全部 Keys/Devices 数据
+- 两个不同系统同时写 Storage 时的业务级合并
+
+这些项目必须在双系统、同适配器、可控配对设备的实验环境中验证。
