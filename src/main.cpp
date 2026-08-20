@@ -298,10 +298,12 @@ static bool save_pair(
 static bool load_snapshot(const fs::path& path, Snapshot& snap) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
+        g_log.write(L"错误", L"无法打开快照文件：" + path.wstring());
         return false;
     }
     std::vector<BYTE> payload((std::istreambuf_iterator<char>(in)), {});
     if (payload.size() < 12 || std::memcmp(payload.data(), "BLESNAP2", 8) != 0) {
+        g_log.write(L"错误", L"快照格式头无效：" + path.filename().wstring());
         return false;
     }
     uint32_t version = 0;
@@ -309,10 +311,12 @@ static bool load_snapshot(const fs::path& path, Snapshot& snap) {
     char magic[8]{};
     data.read(magic, 8);
     if (!ru32(data, version) || version != 2 || !decode_key(data, snap.root)) {
+        g_log.write(L"错误", L"快照解析失败：" + path.filename().wstring());
         return false;
     }
     char trailing = 0;
     if (data.read(&trailing, 1)) {
+        g_log.write(L"错误", L"快照包含尾随数据：" + path.filename().wstring());
         return false;
     }
     snap.hash = sha256(payload);
@@ -324,8 +328,33 @@ static bool load_snapshot(const fs::path& path, Snapshot& snap) {
     const auto ini = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring();
     const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos;
     const wchar_t* hash_key = is_keys ? L"KeysHash" : L"DevicesHash";
-    GetPrivateProfileStringW(L"Meta", hash_key, L"", expected, 256, ini.c_str());
-    return expected[0] != L'\0' && snap.hash == expected;
+    const auto ini_path = path.parent_path().parent_path() / L"state" / L"metadata.ini";
+    const std::string key_prefix = wide_to_utf8(hash_key) + "=";
+    std::ifstream metadata(ini_path, std::ios::binary);
+    std::string line;
+    std::string hash_value;
+    while (std::getline(metadata, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind(key_prefix, 0) == 0) {
+            hash_value = line.substr(key_prefix.size());
+            break;
+        }
+    }
+    const int hash_chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, hash_value.c_str(), static_cast<int>(hash_value.size()), expected, static_cast<int>(std::size(expected)) - 1);
+    if (hash_chars <= 0) {
+        g_log.write(L"错误", L"metadata.ini 哈希字段不是有效 UTF-8：" + std::wstring(hash_key));
+        expected[0] = L'\0';
+    }
+    else expected[hash_chars] = L'\0';
+    const bool hash_match = expected[0] != L'\0' && lower(snap.hash) == lower(expected);
+    if (!hash_match) {
+        g_log.write(L"错误", L"快照校验失败：" + path.filename().wstring()
+            + L"，快照Hash=" + (snap.hash.empty() ? L"EMPTY" : snap.hash)
+            + L"，MetadataHash=" + (expected[0] == L'\0' ? L"EMPTY" : expected));
+    } else {
+        g_log.write(L"调试", L"快照校验成功：" + path.filename().wstring());
+    }
+    return hash_match;
 }
 static bool equal_key(const Key& a, const Key& b) {
     if (a.values.size() != b.values.size() || a.children.size() != b.children.size()) {
@@ -439,7 +468,7 @@ static bool apply_key(
     RegistryWriteSummary& summary
 ) {
     HKEY h = nullptr;
-    if (RegCreateKeyExW(
+    const LONG create_result = RegCreateKeyExW(
             parent,
             desired.name.c_str(),
             0,
@@ -448,7 +477,9 @@ static bool apply_key(
             KEY_READ | KEY_WRITE | KEY_WOW64_64KEY,
             nullptr,
             &h,
-            nullptr) != ERROR_SUCCESS) {
+            nullptr);
+    if (create_result != ERROR_SUCCESS) {
+        g_log.write(L"错误", L"恢复注册表创建键失败：" + redact_identifier(desired.name) + L"，错误码=" + std::to_wstring(create_result));
         return false;
     }
     ++summary.visited_keys;
@@ -484,6 +515,7 @@ static bool apply_key(
                 value.type,
                 value.data.data(),
                 static_cast<DWORD>(value.data.size())) != ERROR_SUCCESS) {
+            g_log.write(L"错误", L"恢复注册表写入值失败：" + redact_identifier(desired.name) + L"/" + redact_identifier(name) + L"，错误码=" + std::to_wstring(GetLastError()));
             RegCloseKey(h);
             return false;
         }
@@ -569,8 +601,18 @@ static bool radio_state(bool& known, bool& enabled) { known = false; enabled = f
 
 static bool visible_paired_device_count(size_t& count) {
     count = 0;
+    BLUETOOTH_FIND_RADIO_PARAMS radio_params{};
+    radio_params.dwSize = sizeof(radio_params);
+    HANDLE radio = nullptr;
+    HBLUETOOTH_RADIO_FIND radio_find = BluetoothFindFirstRadio(&radio_params, &radio);
+    if (radio_find == nullptr || radio == nullptr) {
+        if (radio_find != nullptr) BluetoothFindRadioClose(radio_find);
+        g_log.write(L"警告", L"BluetoothFindFirstRadio 失败，无法绑定设备枚举到 Bluetooth Radio");
+        return false;
+    }
     BLUETOOTH_DEVICE_SEARCH_PARAMS search{};
     search.dwSize = sizeof(search);
+    search.hRadio = radio;
     search.fReturnAuthenticated = TRUE;
     search.fReturnRemembered = TRUE;
     search.fReturnConnected = TRUE;
@@ -579,6 +621,8 @@ static bool visible_paired_device_count(size_t& count) {
     HBLUETOOTH_DEVICE_FIND find = BluetoothFindFirstDevice(&search, &device);
     if (find == nullptr) {
         const DWORD error = GetLastError();
+        BluetoothFindRadioClose(radio_find);
+        CloseHandle(radio);
         if (error == ERROR_NO_MORE_ITEMS || error == ERROR_NOT_FOUND) return true;
         g_log.write(L"警告", L"BluetoothFindFirstDevice 失败，错误码=" + std::to_wstring(error));
         return false;
@@ -589,6 +633,8 @@ static bool visible_paired_device_count(size_t& count) {
         device.dwSize = sizeof(device);
     } while (BluetoothFindNextDevice(find, &device));
     BluetoothFindDeviceClose(find);
+    BluetoothFindRadioClose(radio_find);
+    CloseHandle(radio);
     return true;
 }
 
@@ -769,11 +815,24 @@ static void worker() {
             if (got_devices && got_keys) {
                 Snapshot stored_devices;
                 Snapshot stored_keys;
-                const bool has_stored = load_snapshot(devices_file, stored_devices)
-                    && load_snapshot(keys_file, stored_keys);
-
+                const bool devices_snapshot_valid = load_snapshot(devices_file, stored_devices);
+                const bool keys_snapshot_valid = load_snapshot(keys_file, stored_keys);
+                const bool has_stored = devices_snapshot_valid && keys_snapshot_valid;
+                const bool blocked_invalid_storage = !has_stored && fs::exists(devices_file) && fs::exists(keys_file);
+                if (blocked_invalid_storage) {
+                    g_log.write(L"错误", L"发现已有蓝牙持久化快照但校验失败，禁止用当前本地状态覆盖；请检查 metadata.ini 编码、哈希或文件损坏");
+                }
                 bool restored = false;
-                if (!has_stored || !have_local) {
+                const bool local_matches_stored = has_stored
+                    && equal_key(now_devices.root, stored_devices.root)
+                    && equal_key(now_keys.root, stored_keys.root);
+                if (blocked_invalid_storage) {
+                    std::this_thread::sleep_for(250ms);
+                } else if (local_matches_stored) {
+                    local_devices = std::move(now_devices);
+                    local_keys = std::move(now_keys);
+                    have_local = true;
+                } else if (!has_stored || !have_local) {
                     if (has_stored) {
                         const bool local_differs = !equal_key(now_devices.root, stored_devices.root)
                             || !equal_key(now_keys.root, stored_keys.root);
@@ -788,8 +847,12 @@ static void worker() {
                             restore_deadline = GetTickCount64() + 30000;
                             expected_devices_hash = stored_devices.hash;
                             expected_keys_hash = stored_keys.hash;
-                            if (restore_registry(DEV_ROOT, stored_devices, devices_write)
-                                && restore_registry(KEY_ROOT, stored_keys, keys_write)) {
+                            g_log.write(L"调试", L"开始恢复 Bluetooth Devices/Keys 注册表");
+                            if (!restore_registry(DEV_ROOT, stored_devices, devices_write)) {
+                                g_log.write(L"错误", L"恢复 Bluetooth Devices 注册表失败，错误码=" + std::to_wstring(GetLastError()));
+                            } else if (!restore_registry(KEY_ROOT, stored_keys, keys_write)) {
+                                g_log.write(L"错误", L"恢复 Bluetooth Keys 注册表失败，错误码=" + std::to_wstring(GetLastError()));
+                            } else {
                                 g_log.write(
                                     L"信息",
                                     L"已向系统写入蓝牙注册表：Devices 设置值="
@@ -824,15 +887,19 @@ static void worker() {
                             }
                             log_visible_paired_device_count(local_devices.root, L"恢复后检查");
                         }
-                    } else {
+                    } else if (!has_stored && !blocked_invalid_storage) {
                         ++snapshot_version;
-                        save_pair(config.storage, now_devices, now_keys, machine_id, snapshot_version);
+                        if (!save_pair(config.storage, now_devices, now_keys, machine_id, snapshot_version)) {
+                            g_log.write(L"错误", L"首次蓝牙基线保存失败，保留当前状态但不宣称持久化成功");
+                        }
                         local_devices = std::move(now_devices);
                         local_keys = std::move(now_keys);
                         have_local = true;
                         g_log.write(L"信息", L"本地蓝牙状态已发布为基线");
                         log_device_list(local_devices.root, L"当前已配对设备注册表记录");
                         log_visible_paired_device_count(local_devices.root, L"基线检查");
+                    } else if (has_stored) {
+                        g_log.write(L"错误", L"持久化蓝牙快照存在但恢复注册表失败，禁止用当前本地状态覆盖持久化数据");
                     }
                 } else if (!equal_key(local_devices.root, now_devices.root)
                     || !equal_key(local_keys.root, now_keys.root)) {

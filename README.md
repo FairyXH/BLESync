@@ -174,7 +174,8 @@ D:\BLESyncData\
 - 蓝牙服务处于 `START_PENDING` 或 `STOP_PENDING` 时等待。
 - 无法确认蓝牙适配器或 Radio 状态时不恢复、不强制打开蓝牙、不重启 `bthserv`。
 - 服务首次运行且没有有效持久化快照时，把当前本地状态作为基线。
-- 存在有效持久化快照时，启动阶段尝试按注册表树恢复，并在恢复后重新读取验证。
+- `BTHPORT\Parameters\Devices/Keys` 快照校验成功且本地已一致时不会重复写入。
+- `Enum\BTH` / `Enum\BTHENUM` 没有对应设备实例时，即使 BTHPORT 数据存在，也只能报告“配对数据已持久化”，不能报告“设备已在设置界面恢复”。
 - 稳定运行期间检测到本地增加或删除时，把当前本地状态发布到 Storage，因此支持增加和删除镜像。
 - 当 Storage 与本地状态冲突时，当前策略保留稳定本地状态并记录冲突，不静默覆盖用户刚刚执行的配对或删除操作。
 - 使用全局命名互斥体保护共享 Storage，并设置 2 秒超时；超时后安全退出当前工作线程，不无限等待。
@@ -206,7 +207,29 @@ BUILTIN\Administrators：完全控制
 
 普通用户不能读取 Storage。Link Key 和其他敏感二进制数据不会进入日志。不要把 StoragePath 配置到普通用户共享目录。
 
-## 已知 Wi-Fi 行为
+## 蓝牙设备可见性边界
+
+当前同步对象是：
+
+```text
+BTHPORT\Parameters\Devices
+BTHPORT\Parameters\Keys
+```
+
+这些数据代表配对记录和认证材料，但 Windows 设置界面还依赖当前安装生成的：
+
+```text
+Enum\BTH
+Enum\BTHENUM
+Control\DeviceClasses
+Device Container / PnP instance state
+```
+
+本机实测：BTHPORT 中存在两个设备目录，而 `Enum\BTHENUM` 没有对应设备实例，Windows Bluetooth API 只能枚举到一个设备。因此复制 `Devices/Keys` 不能保证设备在设置界面出现，也不能保证可连接。
+
+BLESync 不直接复制这些 PnP/设备接口树，也不伪造设备实例，不调用设备重启或 `bthserv` 重启。服务只会请求一次安全的 Bluetooth PnP 重新枚举并记录实际可见数量。完整跨系统恢复必须在目标 Windows 上重新配对，或另行实现经过验证的 PnP/设备容器重建方案。
+
+
 
 Wi-Fi 正常运行期间“本地删除不删除 Global，后续可能重新传播”是本项目的明确设计，不是 Windows API 的默认行为。当前 Windows WLAN Native API 只能对当前存在的 Interface GUID 写入 Profile；离线适配器只保留历史 Profile 贡献，重新插入后重新枚举并传播。
 

@@ -58,7 +58,13 @@ The service now starts a separate `WifiSyncManager` after the shared Storage mut
 
 See `docs\WifiProfileAnalysis.md` and `docs\WifiSyncDesign.md` for API evidence, key protection, offline-interface limits, conflict handling, and unverified cross-system DPAPI/EAP boundaries.
 
-## Registry 快照
+## 蓝牙设备可见性边界
+
+当前同步对象是 `BTHPORT\Parameters\Devices` 与 `BTHPORT\Parameters\Keys`。Windows 设置界面还依赖当前安装生成的 `Enum\BTH`、`Enum\BTHENUM`、`Control\DeviceClasses` 和 Device Container/PnP instance state。
+
+如果 BTHPORT 有设备而 `Enum\BTHENUM` 没有对应设备实例，复制 `Devices/Keys` 不能保证设备出现或可连接。BLESync 不直接复制 PnP/设备接口树，也不伪造设备实例；只请求一次 Bluetooth PnP 重新枚举并记录实际可见数量。
+
+
 
 快照树由以下对象组成：
 
