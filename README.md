@@ -162,8 +162,9 @@ D:\BLESyncData\
 │  └─ keys.regdata.backup
 ├─ state\
 │  └─ metadata.ini
-└─ logs\
-   └─ BLESync.log
+├─ logs\
+│  └─ BLESync.log
+│     BLESync.log.previous
 ```
 
 快照使用自定义二进制格式，带版本标记 `BLESNAP2`。写入过程为：临时文件、`FlushFileBuffers`、备份旧文件、原子替换。快照内容使用 Windows CNG `SHA-256` 计算摘要，元数据记录摘要和大小。
@@ -181,9 +182,12 @@ D:\BLESyncData\
 
 ## 详细日志
 
-服务会记录但不会记录 Link Key 原文：
+- `BLESync.log` 是当前服务进程日志；新进程启动时旧文件移动为 `BLESync.log.previous`。
+- `BLESync.log.previous` 最多保留一份，下一次新进程启动会覆盖它。
+- 日志写入调用 `FlushFileBuffers`，避免进程异常退出时丢失最后记录。
+- 蓝牙状态边沿和注册表通知用于缩短用户 OFF→ON 后的同步等待，不调用 `bthserv` 重启。
 
-- 当前已配对设备数量和脱敏后的设备标识。
+服务会记录但不会记录 Link Key 原文：
 - Registry 子键增加、删除。
 - Registry value 增加、删除、修改。
 - value 类型和字节长度；不会写入敏感二进制内容。
@@ -216,7 +220,7 @@ Wi-Fi 正常运行期间“本地删除不删除 Global，后续可能重新传�
 powershell -ExecutionPolicy Bypass -File tests\run_static_tests.ps1
 ```
 
-动态验证需要管理员权限。当前系统已验证过服务注册、LocalSystem 运行、延迟自动启动、Storage ACL、Devices/Keys 快照生成和日志写入。真实的“配对新设备、删除设备、重启 Windows、第二系统恢复”仍需要可控的双系统蓝牙实验环境。
+动态验证需要管理员权限。当前系统已验证过服务注册、LocalSystem 运行、自动启动（非延迟）、Storage ACL、Devices/Keys 快照生成、日志轮换和 Bluetooth PnP 重新枚举请求。真实的“配对新设备、删除设备、重启 Windows、第二系统恢复”仍需要可控的双系统蓝牙实验环境。
 
 ## 完成度与未验证边界
 

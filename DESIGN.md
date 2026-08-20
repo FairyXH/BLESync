@@ -21,7 +21,7 @@ BLESync 不重定向整个 Windows Registry Hive，也不替换 `SYSTEM` 文件�
 
 程序分为两种模式：
 
-1. 控制器模式：定位 EXE 所在目录，读取同目录 INI，创建或更新服务，配置 LocalSystem、延迟启动和失败恢复，然后启动服务并退出。
+1. 控制器模式：定位 EXE 所在目录，读取同目录 INI，创建或更新服务，配置 LocalSystem、自动启动（非延迟）和失败恢复，然后启动服务并退出。
 2. 服务模式：通过 SCM 注册服务入口，运行工作线程，响应停止和关机控制码。
 
 核心职责包括：
@@ -36,7 +36,15 @@ BLESync 不重定向整个 Windows Registry Hive，也不替换 `SYSTEM` 文件�
 - Bluetooth 服务状态检测
 - 周期同步
 
-## Wi-Fi Architecture
+日志文件采用单份轮换：新进程启动时删除旧 `BLESync.log.previous`，再把当前 `BLESync.log` 移动为 `.previous`，最多保留两份。
+
+## 蓝牙开关即时同步
+
+服务每 250ms 检查一次 Bluetooth Adapter 的 PnP 状态边沿。检测到 `disabled -> enabled` 后立即打断等待，不等完整 `ScanInterval`，重新加载持久化 `Devices/Keys` 快照并执行一次同步。
+
+这仍然不会启动、停止或重启 `bthserv`。恢复后会请求一次 Bluetooth PnP 重新枚举；这是非破坏性的设备枚举请求，不保证 Windows 一定从 BTHPORT 注册表重建所有设备实例。
+
+如果 Registry 有设备但 Windows Bluetooth API 数量为 0，记录警告；这表示注册表写入完成但 Windows 设备枚举尚未恢复，不能视为设备已经出现在设置界面。
 
 The service now starts a separate `WifiSyncManager` after the shared Storage mutex is acquired. It uses Native WLAN API and a one-second shared worker loop; Bluetooth registry decisions remain in their existing branch.
 

@@ -4,6 +4,7 @@
 #include <devguid.h>
 #include <bcrypt.h>
 #include <sddl.h>
+#include <bluetoothapis.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -109,11 +110,29 @@ static std::string wide_to_utf8(const std::wstring& value) { if (value.empty()) 
 static std::wstring format_message(const wchar_t* level, const std::wstring& message) { SYSTEMTIME t{}; GetLocalTime(&t); std::wstringstream out; out << L"[" << std::setfill(L'0') << std::setw(2) << t.wHour << L":" << std::setw(2) << t.wMinute << L":" << std::setw(2) << t.wSecond << L"] [" << level << L"] " << message; return out.str(); }
 
 class Logger {
-    std::mutex mutex_; fs::path path_;
+    std::mutex mutex_;
+    fs::path path_;
 public:
-    void init(const Config& c) { path_ = c.storage / L"logs" / L"BLESync.log"; std::error_code e; fs::create_directories(path_.parent_path(), e); }
+    void init(const Config& c) {
+        path_ = c.storage / L"logs" / L"BLESync.log";
+        std::error_code error;
+        fs::create_directories(path_.parent_path(), error);
+        if (error) return;
+        const fs::path previous = path_.wstring() + L".previous";
+        DeleteFileW(previous.c_str());
+        if (GetFileAttributesW(path_.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            MoveFileExW(path_.c_str(), previous.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        }
+    }
     void write(const wchar_t* level, const std::wstring& message) {
-        std::lock_guard<std::mutex> lock(mutex_); const auto line = wide_to_utf8(format_message(level, message)) + "\r\n"; HANDLE h = CreateFileW(path_.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (h == INVALID_HANDLE_VALUE) return; DWORD written = 0; WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr); CloseHandle(h);
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto line = wide_to_utf8(format_message(level, message)) + "\r\n";
+        HANDLE h = CreateFileW(path_.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return;
+        DWORD written = 0;
+        WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+        FlushFileBuffers(h);
+        CloseHandle(h);
     }
 };
 static Logger g_log;
@@ -547,6 +566,60 @@ static bool restore_registry(
 
 static SERVICE_STATUS_PROCESS service_state(const wchar_t* name) { SERVICE_STATUS_PROCESS result{}; SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT); if (!manager) return result; SC_HANDLE service = OpenServiceW(manager, name, SERVICE_QUERY_STATUS); if (service) { DWORD bytes = 0; QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&result), sizeof(result), &bytes); CloseServiceHandle(service); } CloseServiceHandle(manager); return result; }
 static bool radio_state(bool& known, bool& enabled) { known = false; enabled = false; HDEVINFO info = SetupDiGetClassDevsW(&BLE_DEVICE_CLASS_GUID, nullptr, nullptr, DIGCF_PRESENT); if (info == INVALID_HANDLE_VALUE) return false; SP_DEVINFO_DATA data{}; data.cbSize = sizeof(data); for (DWORD i = 0; SetupDiEnumDeviceInfo(info, i, &data); ++i) { DWORD status = 0, problem = 0; if (CM_Get_DevNode_Status(&status, &problem, data.DevInst, 0) == CR_SUCCESS) { known = true; enabled = (status & DN_STARTED) != 0 && problem == 0; break; } } SetupDiDestroyDeviceInfoList(info); return known; }
+
+static bool visible_paired_device_count(size_t& count) {
+    count = 0;
+    BLUETOOTH_DEVICE_SEARCH_PARAMS search{};
+    search.dwSize = sizeof(search);
+    search.fReturnAuthenticated = TRUE;
+    search.fReturnRemembered = TRUE;
+    search.fReturnConnected = TRUE;
+    BLUETOOTH_DEVICE_INFO device{};
+    device.dwSize = sizeof(device);
+    HBLUETOOTH_DEVICE_FIND find = BluetoothFindFirstDevice(&search, &device);
+    if (find == nullptr) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_NO_MORE_ITEMS || error == ERROR_NOT_FOUND) return true;
+        g_log.write(L"警告", L"BluetoothFindFirstDevice 失败，错误码=" + std::to_wstring(error));
+        return false;
+    }
+    do {
+        ++count;
+        device = {};
+        device.dwSize = sizeof(device);
+    } while (BluetoothFindNextDevice(find, &device));
+    BluetoothFindDeviceClose(find);
+    return true;
+}
+
+static void log_visible_paired_device_count(const Key& registry_devices, const wchar_t* context) {
+    size_t visible = 0;
+    if (!visible_paired_device_count(visible)) {
+        g_log.write(L"警告", std::wstring(context) + L"：无法通过 Windows Bluetooth API 枚举已配对设备");
+        return;
+    }
+    g_log.write(L"信息", std::wstring(context) + L"：Windows Bluetooth API 已配对设备数量=" + std::to_wstring(visible));
+    if (!registry_devices.children.empty() && visible == 0) {
+        g_log.write(L"警告", L"BTHPORT 注册表包含设备记录，但 Windows Bluetooth API 未看到已配对设备；注册表写入不等于设备已在设置中恢复，未尝试重启 Bluetooth 服务");
+    }
+}
+
+static bool request_bluetooth_pnp_reenumeration() {
+    HDEVINFO info = SetupDiGetClassDevsW(&BLE_DEVICE_CLASS_GUID, nullptr, nullptr, DIGCF_PRESENT);
+    if (info == INVALID_HANDLE_VALUE) return false;
+    SP_DEVINFO_DATA data{};
+    data.cbSize = sizeof(data);
+    bool requested = false;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(info, i, &data); ++i) {
+        if (CM_Reenumerate_DevNode(data.DevInst, CM_REENUMERATE_SYNCHRONOUS) == CR_SUCCESS) {
+            requested = true;
+            break;
+        }
+    }
+    SetupDiDestroyDeviceInfoList(info);
+    return requested;
+}
+
 static void report_service(DWORD state, DWORD error = NO_ERROR, DWORD hint = 0) { g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS; g_status.dwCurrentState = state; g_status.dwControlsAccepted = state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0; g_status.dwWin32ExitCode = error; g_status.dwWaitHint = hint; SetServiceStatus(g_status_handle, &g_status); }
 
 static bool install_service() {
@@ -656,6 +729,9 @@ static void worker() {
     g_log.write(L"信息", L"服务已启动，InstanceId=" + machine_id);
 
     bool have_local = false;
+    bool last_radio_known = false;
+    bool last_radio_enabled = false;
+    bool bluetooth_enable_edge = false;
     Snapshot local_devices;
     Snapshot local_keys;
     const fs::path devices_file = config.storage / L"registry" / L"devices.regdata";
@@ -667,6 +743,17 @@ static void worker() {
         bool radio_known = false;
         bool radio_enabled = false;
         radio_state(radio_known, radio_enabled);
+        bluetooth_enable_edge = last_radio_known && !last_radio_enabled && radio_known && radio_enabled;
+        if (!last_radio_known || last_radio_enabled != radio_enabled) {
+            g_log.write(L"信息", std::wstring(L"检测到蓝牙适配器状态变化：") + (radio_enabled ? L"已启用" : L"已禁用"));
+            if (bluetooth_enable_edge && config.bluetooth_sync_on_enable) {
+                have_local = false;
+                restoring = false;
+                g_log.write(L"信息", L"检测到用户打开蓝牙，立即重新加载持久化蓝牙快照");
+            }
+            last_radio_known = radio_known;
+            last_radio_enabled = radio_enabled;
+        }
 
         if (service.dwCurrentState == SERVICE_START_PENDING
             || service.dwCurrentState == SERVICE_STOP_PENDING) {
@@ -728,8 +815,14 @@ static void worker() {
                             local_devices = std::move(restored_devices);
                             local_keys = std::move(restored_keys);
                             have_local = true;
-                            g_log.write(L"信息", L"有效的持久化蓝牙状态已恢复并通过验证");
-                            log_device_list(local_devices.root, L"当前已配对设备");
+                            g_log.write(L"信息", L"BTHPORT 注册表快照已恢复并通过哈希验证");
+                            log_device_list(local_devices.root, L"当前已配对设备注册表记录");
+                            if (request_bluetooth_pnp_reenumeration()) {
+                                g_log.write(L"信息", L"已请求 Bluetooth PnP 重新枚举；未重启 bthserv");
+                            } else {
+                                g_log.write(L"警告", L"Bluetooth PnP 重新枚举请求失败；未重启 bthserv");
+                            }
+                            log_visible_paired_device_count(local_devices.root, L"恢复后检查");
                         }
                     } else {
                         ++snapshot_version;
@@ -738,7 +831,8 @@ static void worker() {
                         local_keys = std::move(now_keys);
                         have_local = true;
                         g_log.write(L"信息", L"本地蓝牙状态已发布为基线");
-                        log_device_list(local_devices.root, L"当前已配对设备");
+                        log_device_list(local_devices.root, L"当前已配对设备注册表记录");
+                        log_visible_paired_device_count(local_devices.root, L"基线检查");
                     }
                 } else if (!equal_key(local_devices.root, now_devices.root)
                     || !equal_key(local_keys.root, now_keys.root)) {
@@ -749,7 +843,8 @@ static void worker() {
                     local_devices = std::move(now_devices);
                     local_keys = std::move(now_keys);
                     g_log.write(L"信息", L"稳定的本地蓝牙变化已发布，新增和删除均已镜像");
-                    log_device_list(local_devices.root, L"当前已配对设备");
+                    log_device_list(local_devices.root, L"当前已配对设备注册表记录");
+                    log_visible_paired_device_count(local_devices.root, L"本地变化检查");
                 } else if (restoring && GetTickCount64() < restore_deadline) {
                     g_log.write(L"调试", L"等待恢复后的注册表状态稳定，抑制回写循环");
                 } else if (restoring) {
@@ -776,10 +871,33 @@ static void worker() {
             g_wifi.tick(false);
         }
 
-        for (int i = 0; i < config.interval && !g_stop; ++i) {
+        bool wake_for_bluetooth_change = false;
+        const int wait_slices = std::max(1, config.interval * 4);
+        for (int i = 0; i < wait_slices && !g_stop; ++i) {
             if (!g_stop) {
-                std::this_thread::sleep_for(1s);
+                std::this_thread::sleep_for(250ms);
+                if (config.bluetooth_enabled) {
+                    bool wait_radio_known = false;
+                    bool wait_radio_enabled = false;
+                    radio_state(wait_radio_known, wait_radio_enabled);
+                    if (wait_radio_known && (!last_radio_known || wait_radio_enabled != last_radio_enabled)) {
+                        const bool enabled_edge = last_radio_known && !last_radio_enabled && wait_radio_enabled;
+                        last_radio_known = wait_radio_known;
+                        last_radio_enabled = wait_radio_enabled;
+                        if (enabled_edge && config.bluetooth_sync_on_enable) {
+                            have_local = false;
+                            restoring = false;
+                            g_log.write(L"信息", L"蓝牙开关边沿已检测，立即重新加载持久化蓝牙快照");
+                        }
+                        wake_for_bluetooth_change = true;
+                        g_log.write(L"信息", L"蓝牙开关边沿已检测，立即执行同步扫描");
+                        break;
+                    }
+                }
             }
+        }
+        if (wake_for_bluetooth_change) {
+            continue;
         }
     }
 
