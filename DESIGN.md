@@ -6,7 +6,18 @@ BLESync 不重定向整个 Windows Registry Hive，也不替换 `SYSTEM` 文件�
 
 目标是持久化蓝牙配对身份和相关认证材料，而不是复制所有 Windows PnP 生成数据。`Enum\BTH`、`Enum\BTHENUM`、`Control\DeviceClasses` 仍由 Windows 当前安装生成，不进行机械复制。
 
-## 架构
+## 当前实现与设计修正
+
+本版本相对早期基线增加并修正：
+
+1. `build.bat` 每次都重新编译，避免误用旧 EXE；编译输出写入 `build\compile.log`。
+2. 使用 `MachineId`、`SnapshotVersion`、双快照 SHA-256 和原子 metadata 更新支持双系统审计基础。
+3. Storage ACL 递归覆盖现有快照和日志，避免旧文件保留宽松权限。
+4. 服务启动时只有在本地与 Storage 确实不同且尚未建立本地运行基线时才恢复；本地稳定变化优先发布。
+5. 恢复有有限验证窗口，避免简单的 Restore -> Scan -> Restore 循环。
+6. 服务控制器每次安装都会刷新绝对二进制路径、账户、自动启动配置和恢复策略。
+7. 无参数启动和 `--install`/`--uninstall` 支持 UAC `runas` 提权。
+
 
 程序分为两种模式：
 

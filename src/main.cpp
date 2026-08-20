@@ -44,17 +44,18 @@ static SERVICE_STATUS g_status{};
 struct Config { fs::path exe_dir, storage; int interval = 5; std::wstring log_level = L"INFO"; };
 struct Value { DWORD type = REG_NONE; std::vector<BYTE> data; };
 struct Key { std::wstring name; std::map<std::wstring, Value> values; std::map<std::wstring, Key> children; };
-struct Snapshot { Key root; std::wstring hash; uint64_t bytes = 0; };
+struct Snapshot {
+    Key root;
+    std::wstring hash;
+    uint64_t bytes = 0;
+};
 
-static std::wstring trim(std::wstring s) {
-    while (!s.empty() && iswspace(s.front())) {
-        s.erase(s.begin());
-    }
-    while (!s.empty() && iswspace(s.back())) {
-        s.pop_back();
-    }
-    return s;
-}
+struct SyncMetadata {
+    std::wstring machine_id;
+    uint64_t version = 0;
+    uint64_t updated_tick = 0;
+    std::wstring origin;
+};
 
 static std::wstring lower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), towlower);
@@ -102,21 +103,30 @@ static bool is_admin() {
 }
 
 static bool protect_storage(const fs::path& path) {
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
-            SDDL_REVISION_1,
-            &sd,
-            nullptr)) {
-        return false;
-    }
+    return ProtectStorage(path);
+}
 
-    std::error_code error;
-    fs::create_directories(path, error);
-    const bool ok = !error
-        && SetFileSecurityW(path.c_str(), DACL_SECURITY_INFORMATION, sd) != FALSE;
-    LocalFree(sd);
-    return ok;
+static std::wstring new_instance_id() {
+    GUID guid{};
+    if (CoCreateGuid(&guid) != S_OK) {
+        return L"unknown-" + std::to_wstring(GetCurrentProcessId());
+    }
+    wchar_t text[64]{};
+    StringFromGUID2(guid, text, static_cast<int>(std::size(text)));
+    return text;
+}
+
+static std::wstring read_or_create_instance_id(const fs::path& storage) {
+    const auto path = (storage / L"state" / L"instance.ini").wstring();
+    wchar_t value[128]{};
+    GetPrivateProfileStringW(L"Instance", L"MachineId", L"", value, 128, path.c_str());
+    if (value[0] != L'\0') {
+        return value;
+    }
+    const std::wstring id = new_instance_id();
+    fs::create_directories(storage / L"state");
+    WritePrivateProfileStringW(L"Instance", L"MachineId", id.c_str(), path.c_str());
+    return id;
 }
 
 static void u32(std::ostream& out, uint32_t value) { out.write(reinterpret_cast<const char*>(&value), sizeof(value)); }
@@ -145,22 +155,137 @@ static bool capture_registry(const wchar_t* root, Snapshot& snap) {
     const bool ok = read(handle, snap.root); RegCloseKey(handle); return ok;
 }
 
-static bool serialize_snapshot(const Snapshot& snap, std::vector<BYTE>& payload) { std::ostringstream out(std::ios::binary); out.write("BLESNAP2", 8); u32(out, 2); encode_key(out, snap.root); const auto value = out.str(); payload.assign(value.begin(), value.end()); return true; }
-static bool save_snapshot(const fs::path& path, const Snapshot& snap) {
-    std::vector<BYTE> payload; if (!serialize_snapshot(snap, payload)) return false; const auto hash = sha256(payload); const fs::path temp = path.wstring() + L".tmp"; const fs::path backup = path.wstring() + L".backup"; std::error_code e; fs::create_directories(path.parent_path(), e); if (e) return false;
-    HANDLE h = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (h == INVALID_HANDLE_VALUE) return false; DWORD written = 0; const bool wrote = WriteFile(h, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) && written == payload.size() && FlushFileBuffers(h); CloseHandle(h); if (!wrote) { DeleteFileW(temp.c_str()); return false; }
-    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        if (!MoveFileExW(path.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return false;
+static bool serialize_snapshot(const Snapshot& snap, std::vector<BYTE>& payload) { std::ostringstream out(std::ios::out | std::ios::binary); out.write("BLESNAP2", 8); u32(out, 2); encode_key(out, snap.root); const auto value = out.str(); payload.assign(value.begin(), value.end()); return true; }
+static bool save_metadata(const fs::path& storage, const std::wstring& devices_hash, const std::wstring& keys_hash, const std::wstring& machine_id, uint64_t version) {
+    const auto state = storage / L"state";
+    std::error_code error;
+    fs::create_directories(state, error);
+    if (error) {
+        return false;
     }
-    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { DeleteFileW(temp.c_str()); return false; }
-    std::error_code state_error;
-    fs::create_directories(path.parent_path().parent_path() / L"state", state_error);
-    const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos; const std::wstring meta_key = is_keys ? L"KeysHash" : L"DevicesHash"; wchar_t other[256]{}; const std::wstring other_key = is_keys ? L"DevicesHash" : L"KeysHash"; const auto meta_path = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring(); GetPrivateProfileStringW(L"Meta", other_key.c_str(), L"", other, 256, meta_path.c_str());
-    std::string meta_text = "[Meta]\r\n" + wide_to_utf8(meta_key) + "=" + wide_to_utf8(hash) + "\r\n" + wide_to_utf8(other_key) + "=" + wide_to_utf8(other) + "\r\nBytes=" + std::to_string(payload.size()) + "\r\nUpdatedTick=" + std::to_string(GetTickCount64()) + "\r\n";
-    HANDLE mh = CreateFileW((path.parent_path().parent_path() / L"state" / L"metadata.ini").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (mh != INVALID_HANDLE_VALUE) { DWORD written = 0; WriteFile(mh, meta_text.data(), static_cast<DWORD>(meta_text.size()), &written, nullptr); FlushFileBuffers(mh); CloseHandle(mh); }
+    const auto path = state / L"metadata.ini";
+    const auto temp = state / L"metadata.ini.tmp";
+    const std::wstring content = L"[Meta]\r\n"
+        L"MachineId=" + machine_id + L"\r\n"
+        L"SnapshotVersion=" + std::to_wstring(version) + L"\r\n"
+        L"DevicesHash=" + devices_hash + L"\r\n"
+        L"KeysHash=" + keys_hash + L"\r\n"
+        L"UpdatedTick=" + std::to_wstring(GetTickCount64()) + L"\r\n";
+    HANDLE handle = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const std::string utf8 = wide_to_utf8(content);
+    DWORD written = 0;
+    const bool ok = WriteFile(handle, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr)
+        && written == utf8.size()
+        && FlushFileBuffers(handle);
+    CloseHandle(handle);
+    if (!ok) {
+        DeleteFileW(temp.c_str());
+        return false;
+    }
+    return MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
+static uint64_t read_snapshot_version(const fs::path& storage) {
+    wchar_t value[64]{};
+    GetPrivateProfileStringW(L"Meta", L"SnapshotVersion", L"0", value, 64, (storage / L"state" / L"metadata.ini").c_str());
+    try {
+        return std::stoull(value);
+    } catch (...) {
+        return 0;
+    }
+}
+
+static bool save_snapshot(const fs::path& path, const Snapshot& snap, std::wstring* saved_hash = nullptr) {
+    std::vector<BYTE> payload;
+    if (!serialize_snapshot(snap, payload)) {
+        return false;
+    }
+    const auto hash = sha256(payload);
+    if (saved_hash != nullptr) {
+        *saved_hash = hash;
+    }
+    const fs::path temp = path.wstring() + L".tmp";
+    const fs::path backup = path.wstring() + L".backup";
+    std::error_code error;
+    fs::create_directories(path.parent_path(), error);
+    if (error) {
+        return false;
+    }
+    HANDLE handle = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    const bool wrote = WriteFile(handle, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr)
+        && written == payload.size()
+        && FlushFileBuffers(handle);
+    CloseHandle(handle);
+    if (!wrote) {
+        DeleteFileW(temp.c_str());
+        return false;
+    }
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES
+        && !MoveFileExW(path.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp.c_str());
+        return false;
+    }
     return true;
 }
-static bool load_snapshot(const fs::path& path, Snapshot& snap) { std::ifstream in(path, std::ios::binary); if (!in) return false; std::vector<BYTE> payload((std::istreambuf_iterator<char>(in)), {}); if (payload.size() < 12 || std::memcmp(payload.data(), "BLESNAP2", 8) != 0) return false; uint32_t version = 0; std::istringstream data(std::string(payload.begin(), payload.end()), std::ios::binary); char magic[8]; data.read(magic, 8); if (!ru32(data, version) || version != 2 || !decode_key(data, snap.root)) return false; snap.hash = sha256(payload); snap.bytes = payload.size(); if (snap.hash.empty()) return false; wchar_t expected[256]{}; const auto ini = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring(); const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos; const wchar_t* hash_key = is_keys ? L"KeysHash" : L"DevicesHash"; GetPrivateProfileStringW(L"Meta", hash_key, L"", expected, 256, ini.c_str()); return expected[0] != L'\0' && snap.hash == expected; }
+
+static bool save_pair(
+    const fs::path& storage,
+    const Snapshot& devices,
+    const Snapshot& keys,
+    const std::wstring& machine_id,
+    uint64_t version) {
+    std::wstring devices_hash;
+    std::wstring keys_hash;
+    if (!save_snapshot(storage / L"registry" / L"devices.regdata", devices, &devices_hash)
+        || !save_snapshot(storage / L"registry" / L"keys.regdata", keys, &keys_hash)) {
+        return false;
+    }
+    return save_metadata(storage, devices_hash, keys_hash, machine_id, version);
+}
+
+static bool load_snapshot(const fs::path& path, Snapshot& snap) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::vector<BYTE> payload((std::istreambuf_iterator<char>(in)), {});
+    if (payload.size() < 12 || std::memcmp(payload.data(), "BLESNAP2", 8) != 0) {
+        return false;
+    }
+    uint32_t version = 0;
+    std::istringstream data(std::string(payload.begin(), payload.end()), std::ios::in | std::ios::binary);
+    char magic[8]{};
+    data.read(magic, 8);
+    if (!ru32(data, version) || version != 2 || !decode_key(data, snap.root)) {
+        return false;
+    }
+    char trailing = 0;
+    if (data.read(&trailing, 1)) {
+        return false;
+    }
+    snap.hash = sha256(payload);
+    snap.bytes = payload.size();
+    if (snap.hash.empty()) {
+        return false;
+    }
+    wchar_t expected[256]{};
+    const auto ini = (path.parent_path().parent_path() / L"state" / L"metadata.ini").wstring();
+    const bool is_keys = lower(path.filename().wstring()).find(L"keys") != std::wstring::npos;
+    const wchar_t* hash_key = is_keys ? L"KeysHash" : L"DevicesHash";
+    GetPrivateProfileStringW(L"Meta", hash_key, L"", expected, 256, ini.c_str());
+    return expected[0] != L'\0' && snap.hash == expected;
+}
 static bool equal_key(const Key& a, const Key& b) {
     if (a.values.size() != b.values.size() || a.children.size() != b.children.size()) {
         return false;
@@ -402,7 +527,65 @@ static SERVICE_STATUS_PROCESS service_state(const wchar_t* name) { SERVICE_STATU
 static bool radio_state(bool& known, bool& enabled) { known = false; enabled = false; HDEVINFO info = SetupDiGetClassDevsW(&BLE_DEVICE_CLASS_GUID, nullptr, nullptr, DIGCF_PRESENT); if (info == INVALID_HANDLE_VALUE) return false; SP_DEVINFO_DATA data{}; data.cbSize = sizeof(data); for (DWORD i = 0; SetupDiEnumDeviceInfo(info, i, &data); ++i) { DWORD status = 0, problem = 0; if (CM_Get_DevNode_Status(&status, &problem, data.DevInst, 0) == CR_SUCCESS) { known = true; enabled = (status & DN_STARTED) != 0 && problem == 0; break; } } SetupDiDestroyDeviceInfoList(info); return known; }
 static void report_service(DWORD state, DWORD error = NO_ERROR, DWORD hint = 0) { g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS; g_status.dwCurrentState = state; g_status.dwControlsAccepted = state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0; g_status.dwWin32ExitCode = error; g_status.dwWaitHint = hint; SetServiceStatus(g_status_handle, &g_status); }
 
-static bool install_service() { if (!is_admin()) return false; const Config c = load_config(); SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS); if (!manager) return false; const auto exe = (c.exe_dir / L"BLESync.exe").wstring(); SC_HANDLE service = OpenServiceW(manager, SERVICE_NAME, SERVICE_ALL_ACCESS); if (!service) service = CreateServiceW(manager, SERVICE_NAME, L"BLESync Bluetooth Persistence Service", SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, exe.c_str(), nullptr, nullptr, nullptr, L"LocalSystem", nullptr); if (!service) { CloseServiceHandle(manager); return false; } SERVICE_DELAYED_AUTO_START_INFO delayed{TRUE}; ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed); SC_ACTION actions[3]{{SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 120000}, {SC_ACTION_RESTART, 300000}}; SERVICE_FAILURE_ACTIONSW failure{}; failure.cActions = 3; failure.lpsaActions = actions; ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure); const bool started = StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING; CloseServiceHandle(service); CloseServiceHandle(manager); return started; }
+static bool install_service() {
+    if (!is_admin()) {
+        return false;
+    }
+    const Config c = load_config();
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+    if (!manager) {
+        return false;
+    }
+    const auto exe = (c.exe_dir / L"BLESync.exe").wstring();
+    SC_HANDLE service = OpenServiceW(manager, SERVICE_NAME, SERVICE_ALL_ACCESS);
+    if (!service) {
+        service = CreateServiceW(
+            manager,
+            SERVICE_NAME,
+            L"BLESync Bluetooth Persistence Service",
+            SERVICE_ALL_ACCESS,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            exe.c_str(),
+            nullptr,
+            nullptr,
+            nullptr,
+            L"LocalSystem",
+            nullptr);
+    }
+    if (!service) {
+        CloseServiceHandle(manager);
+        return false;
+    }
+    if (!ChangeServiceConfigW(
+            service,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            exe.c_str(),
+            nullptr,
+            nullptr,
+            nullptr,
+            L"LocalSystem",
+            nullptr,
+            L"BLESync Bluetooth Persistence Service")) {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        return false;
+    }
+    SERVICE_DELAYED_AUTO_START_INFO delayed{TRUE};
+    ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
+    SC_ACTION actions[3]{{SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 120000}, {SC_ACTION_RESTART, 300000}};
+    SERVICE_FAILURE_ACTIONSW failure{};
+    failure.cActions = 3;
+    failure.lpsaActions = actions;
+    ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
+    const bool started = StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING;
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    return started;
+}
 static bool uninstall_service() { if (!is_admin()) return false; SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS); if (!manager) return false; SC_HANDLE service = OpenServiceW(manager, SERVICE_NAME, SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE); if (!service) { CloseServiceHandle(manager); return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST; } SERVICE_STATUS status{}; ControlService(service, SERVICE_CONTROL_STOP, &status); const bool ok = DeleteService(service) != FALSE; CloseServiceHandle(service); CloseServiceHandle(manager); return ok; }
 
 static void worker() {
@@ -429,7 +612,14 @@ static void worker() {
         return;
     }
 
-    g_log.write(L"信息", L"服务已启动");
+    const std::wstring machine_id = read_or_create_instance_id(config.storage);
+    uint64_t snapshot_version = read_snapshot_version(config.storage);
+    bool restoring = false;
+    std::wstring expected_devices_hash;
+    std::wstring expected_keys_hash;
+    uint64_t restore_deadline = 0;
+
+    g_log.write(L"信息", L"服务已启动，InstanceId=" + machine_id);
 
     bool have_local = false;
     Snapshot local_devices;
@@ -463,23 +653,35 @@ static void worker() {
                 bool restored = false;
                 if (!has_stored || !have_local) {
                     if (has_stored) {
-                        RegistryWriteSummary devices_write;
-                        RegistryWriteSummary keys_write;
-                        if (restore_registry(DEV_ROOT, stored_devices, devices_write)
-                            && restore_registry(KEY_ROOT, stored_keys, keys_write)) {
-                            g_log.write(
-                                L"信息",
-                                L"已向系统写入蓝牙注册表：Devices 设置值="
-                                    + std::to_wstring(devices_write.set_values)
-                                    + L"，删除值=" + std::to_wstring(devices_write.deleted_values)
-                                    + L"，访问键=" + std::to_wstring(devices_write.visited_keys)
-                                    + L"，删除键=" + std::to_wstring(devices_write.deleted_keys)
-                                    + L"；Keys 设置值="
-                                    + std::to_wstring(keys_write.set_values)
-                                    + L"，删除值=" + std::to_wstring(keys_write.deleted_values)
-                                    + L"，访问键=" + std::to_wstring(keys_write.visited_keys)
-                                    + L"，删除键=" + std::to_wstring(keys_write.deleted_keys));
-                            restored = true;
+                        const bool local_differs = !equal_key(now_devices.root, stored_devices.root)
+                            || !equal_key(now_keys.root, stored_keys.root);
+                        if (!local_differs) {
+                            local_devices = std::move(now_devices);
+                            local_keys = std::move(now_keys);
+                            have_local = true;
+                        } else if (!have_local) {
+                            RegistryWriteSummary devices_write;
+                            RegistryWriteSummary keys_write;
+                            restoring = true;
+                            restore_deadline = GetTickCount64() + 30000;
+                            expected_devices_hash = stored_devices.hash;
+                            expected_keys_hash = stored_keys.hash;
+                            if (restore_registry(DEV_ROOT, stored_devices, devices_write)
+                                && restore_registry(KEY_ROOT, stored_keys, keys_write)) {
+                                g_log.write(
+                                    L"信息",
+                                    L"已向系统写入蓝牙注册表：Devices 设置值="
+                                        + std::to_wstring(devices_write.set_values)
+                                        + L"，删除值=" + std::to_wstring(devices_write.deleted_values)
+                                        + L"，访问键=" + std::to_wstring(devices_write.visited_keys)
+                                        + L"，删除键=" + std::to_wstring(devices_write.deleted_keys)
+                                        + L"；Keys 设置值="
+                                        + std::to_wstring(keys_write.set_values)
+                                        + L"，删除值=" + std::to_wstring(keys_write.deleted_values)
+                                        + L"，访问键=" + std::to_wstring(keys_write.visited_keys)
+                                        + L"，删除键=" + std::to_wstring(keys_write.deleted_keys));
+                                restored = true;
+                            }
                         }
                     }
 
@@ -495,8 +697,8 @@ static void worker() {
                             log_device_list(local_devices.root, L"当前已配对设备");
                         }
                     } else {
-                        save_snapshot(devices_file, now_devices);
-                        save_snapshot(keys_file, now_keys);
+                        ++snapshot_version;
+                        save_pair(config.storage, now_devices, now_keys, machine_id, snapshot_version);
                         local_devices = std::move(now_devices);
                         local_keys = std::move(now_keys);
                         have_local = true;
@@ -507,12 +709,17 @@ static void worker() {
                     || !equal_key(local_keys.root, now_keys.root)) {
                     log_snapshot_diff(local_devices.root, now_devices.root, L"Devices");
                     log_snapshot_diff(local_keys.root, now_keys.root, L"Keys");
-                    save_snapshot(devices_file, now_devices);
-                    save_snapshot(keys_file, now_keys);
+                    ++snapshot_version;
+                    save_pair(config.storage, now_devices, now_keys, machine_id, snapshot_version);
                     local_devices = std::move(now_devices);
                     local_keys = std::move(now_keys);
                     g_log.write(L"信息", L"稳定的本地蓝牙变化已发布，新增和删除均已镜像");
                     log_device_list(local_devices.root, L"当前已配对设备");
+                } else if (restoring && GetTickCount64() < restore_deadline) {
+                    g_log.write(L"调试", L"等待恢复后的注册表状态稳定，抑制回写循环");
+                } else if (restoring) {
+                    restoring = false;
+                    g_log.write(L"警告", L"恢复验证窗口超时，停止自动回写并保留当前状态");
                 } else if (!equal_key(now_devices.root, stored_devices.root)
                     || !equal_key(now_keys.root, stored_keys.root)) {
                     g_log.write(
@@ -529,7 +736,9 @@ static void worker() {
         }
 
         for (int i = 0; i < config.interval && !g_stop; ++i) {
-            std::this_thread::sleep_for(1s);
+            if (!g_stop) {
+                std::this_thread::sleep_for(1s);
+            }
         }
     }
 
@@ -539,6 +748,32 @@ static void worker() {
 }
 static void WINAPI service_control(DWORD code) { if (code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN) { g_stop = true; report_service(SERVICE_STOP_PENDING, NO_ERROR, 5000); } }
 static void WINAPI service_main(DWORD, LPWSTR*) { g_status_handle = RegisterServiceCtrlHandlerW(SERVICE_NAME, service_control); if (!g_status_handle) return; report_service(SERVICE_START_PENDING, NO_ERROR, 5000); std::thread thread(worker); report_service(SERVICE_RUNNING); thread.join(); report_service(SERVICE_STOPPED); }
+
+static bool request_elevation(const wchar_t* argument) {
+    wchar_t module[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, module, static_cast<DWORD>(std::size(module)));
+    if (length == 0 || length >= std::size(module)) {
+        return false;
+    }
+    SHELLEXECUTEINFOW execute{};
+    execute.cbSize = sizeof(execute);
+    execute.fMask = SEE_MASK_NOCLOSEPROCESS;
+    execute.lpVerb = L"runas";
+    execute.lpFile = module;
+    execute.lpParameters = argument;
+    execute.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&execute)) {
+        return false;
+    }
+    if (execute.hProcess != nullptr) {
+        WaitForSingleObject(execute.hProcess, INFINITE);
+        DWORD exit_code = 1;
+        GetExitCodeProcess(execute.hProcess, &exit_code);
+        CloseHandle(execute.hProcess);
+        return exit_code == 0;
+    }
+    return true;
+}
 
 int wmain(int argc, wchar_t** argv) {
     if (argc > 1) {
@@ -560,9 +795,15 @@ int wmain(int argc, wchar_t** argv) {
             return 0;
         }
         if (arg == L"--install") {
+            if (!is_admin()) {
+                return request_elevation(L"--install") ? 0 : 1;
+            }
             return install_service() ? 0 : 1;
         }
         if (arg == L"--uninstall") {
+            if (!is_admin()) {
+                return request_elevation(L"--uninstall") ? 0 : 1;
+            }
             return uninstall_service() ? 0 : 1;
         }
         if (arg == L"--console") {
@@ -575,8 +816,7 @@ int wmain(int argc, wchar_t** argv) {
             Snapshot keys;
             return capture_registry(DEV_ROOT, devices)
                     && capture_registry(KEY_ROOT, keys)
-                    && save_snapshot(c.storage / L"registry" / L"devices.regdata", devices)
-                    && save_snapshot(c.storage / L"registry" / L"keys.regdata", keys)
+                    && save_pair(c.storage, devices, keys, read_or_create_instance_id(c.storage), read_snapshot_version(c.storage) + 1)
                 ? 0
                 : 1;
         }
@@ -600,8 +840,10 @@ int wmain(int argc, wchar_t** argv) {
     };
     if (!StartServiceCtrlDispatcherW(table)) {
         if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
-            worker();
-            return 0;
+            if (!is_admin()) {
+                return request_elevation(L"--install") ? 0 : 1;
+            }
+            return install_service() ? 0 : 1;
         }
         return 1;
     }

@@ -22,6 +22,14 @@ if ($unknownExit -eq 0) { throw 'Unknown option returned success.' }
 $captureExit = Invoke-BLESync '--capture' 15
 if ($captureExit -notin @(0, 1)) { throw ('--capture returned unexpected code ' + $captureExit) }
 $storage = 'D:\Storageredirect\BLESyncData'
+$acl = (Get-Acl $storage).Access | ForEach-Object { $_.IdentityReference.Value }
+if ($acl -contains 'Everyone' -or $acl -contains 'BUILTIN\Users' -or $acl -contains 'NT AUTHORITY\Authenticated Users') {
+  throw 'Storage ACL grants access to ordinary users.'
+}
+$metadata = Join-Path $storage 'state\metadata.ini'
+if (-not (Test-Path $metadata)) { throw 'metadata.ini missing.' }
+$instance = Join-Path $storage 'state\instance.ini'
+if (-not (Test-Path $instance)) { throw 'instance.ini missing.' }
 $logPath = Join-Path $storage 'logs\BLESync.log'
 if (Test-Path $logPath) {
   $log = Get-Content -Raw $logPath
