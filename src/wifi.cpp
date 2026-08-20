@@ -72,12 +72,14 @@ bool write_atomic(const std::filesystem::path& path, const std::string& data) {
 
 }
 
-bool WifiSyncManager::initialize(const std::filesystem::path& storage, int interval_seconds, bool log_sensitive_names) {
+bool WifiSyncManager::initialize(const std::filesystem::path& storage, int interval_seconds, bool log_sensitive_names, bool sync_on_enable, bool sync_on_service_start) {
     storage_ = storage / L"wifi";
     profiles_dir_ = storage_ / L"profiles";
     pending_dir_ = storage_ / L"pending";
     interval_seconds_ = std::max(1, interval_seconds);
     log_sensitive_names_ = log_sensitive_names;
+    sync_on_enable_ = sync_on_enable;
+    sync_on_service_start_ = sync_on_service_start;
 
     DWORD negotiated = 0;
     const DWORD result = WlanOpenHandle(2, nullptr, &negotiated, &wlan_handle_);
@@ -101,9 +103,9 @@ bool WifiSyncManager::initialize(const std::filesystem::path& storage, int inter
         nullptr,
         nullptr);
     initialized_ = notification_result == ERROR_SUCCESS;
-    dirty_ = true;
-    propagate_pending_ = true;
-    next_scan_tick_ = 0;
+    dirty_ = sync_on_service_start_;
+    propagate_pending_ = sync_on_service_start_;
+    next_scan_tick_ = sync_on_service_start_ ? 0 : GetTickCount64() + static_cast<uint64_t>(interval_seconds_) * 1000;
     return initialized_;
 }
 
@@ -220,6 +222,8 @@ bool WifiSyncManager::merge_global(const std::vector<WifiProfileRecord>& local_p
     bool changed = false;
     for (const auto& local : local_profiles) {
         auto it = global_profiles_.find(local.hash);
+        bool local_changed = false;
+        const auto old_hash = it == global_profiles_.end() ? std::wstring{} : it->second.hash;
         if (it == global_profiles_.end()) {
             WifiGlobalProfile global;
             global.identity = stable_identity(local.name, local.xml);
@@ -228,13 +232,23 @@ bool WifiSyncManager::merge_global(const std::vector<WifiProfileRecord>& local_p
             global.hash = local.hash;
             global.last_observed_tick = local.observed_tick;
             global.connected_observed = local.connected;
+            global.user_profile = local.user_profile;
+            global.group_policy = local.group_policy;
+            global.propagatable = !local.group_policy;
             global.source_interfaces.insert(guid_text(local.interface_guid));
             global_profiles_.emplace(global.hash, std::move(global));
             changed = true;
         } else {
+            local_changed = it->second.hash != local.hash;
+            it->second.xml = local.xml;
+            it->second.hash = local.hash;
+            it->second.connected_observed = local.connected;
+            it->second.user_profile = local.user_profile;
+            it->second.group_policy = local.group_policy;
+            it->second.propagatable = !local.group_policy;
             it->second.last_observed_tick = std::max(it->second.last_observed_tick, local.observed_tick);
-            it->second.connected_observed = it->second.connected_observed || local.connected;
             it->second.source_interfaces.insert(guid_text(local.interface_guid));
+            changed = changed || local_changed;
         }
     }
     if (!changed) return true;
@@ -287,6 +301,7 @@ bool WifiSyncManager::propagate() {
 
     std::map<std::wstring, const WifiGlobalProfile*> masters;
     for (const auto& [_, profile] : global_profiles_) {
+        if (!profile.propagatable) continue;
         auto it = masters.find(profile.name);
         if (it == masters.end()) {
             masters.emplace(profile.name, &profile);
@@ -329,7 +344,14 @@ bool WifiSyncManager::set_profile_on_interface(const GUID& interface_guid, const
 }
 
 void WifiSyncManager::notification(const WLAN_NOTIFICATION_DATA* data) {
-    if (data != nullptr && data->NotificationSource == WLAN_NOTIFICATION_SOURCE_ACM) dirty_ = true;
+    if (data == nullptr || data->NotificationSource != WLAN_NOTIFICATION_SOURCE_ACM) return;
+    const bool enable_event = data->NotificationCode == wlan_notification_acm_autoconf_enabled
+        || data->NotificationCode == wlan_notification_acm_interface_arrival
+        || data->NotificationCode == wlan_notification_acm_connection_complete
+        || data->NotificationCode == wlan_notification_acm_profile_change;
+    if (enable_event && sync_on_enable_) {
+        mark_dirty();
+    }
 }
 
 void WINAPI WifiSyncManager::notification_callback(PWLAN_NOTIFICATION_DATA data, PVOID context) {

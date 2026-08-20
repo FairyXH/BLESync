@@ -29,12 +29,15 @@ struct WifiGlobalProfile {
     std::wstring hash;
     uint64_t last_observed_tick = 0;
     bool connected_observed = false;
+    bool user_profile = false;
+    bool group_policy = false;
+    bool propagatable = true;
     std::set<std::wstring> source_interfaces;
 };
 
 class WifiSyncManager {
 public:
-    bool initialize(const std::filesystem::path& storage, int interval_seconds, bool log_sensitive_names);
+    bool initialize(const std::filesystem::path& storage, int interval_seconds, bool log_sensitive_names, bool sync_on_enable, bool sync_on_service_start);
     void shutdown();
     void mark_dirty();
     void tick(bool force_scan = false);
@@ -71,6 +74,8 @@ private:
     std::atomic<bool> propagate_pending_{true};
     bool initialized_ = false;
     bool log_sensitive_names_ = false;
+    bool sync_on_enable_ = true;
+    bool sync_on_service_start_ = true;
     int interval_seconds_ = 5;
     uint64_t next_scan_tick_ = 0;
 };

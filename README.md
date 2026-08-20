@@ -123,7 +123,7 @@ BLESync.exe --console
 服务名：BLESync
 显示名：BLESync Bluetooth Persistence Service
 账户：LocalSystem
-启动方式：自动启动、延迟自动启动
+启动方式：自动启动
 ```
 
 安装会配置服务失败后的自动重启，并使用逐次增加的重启延迟，避免逻辑错误造成快速重启循环。
@@ -224,8 +224,8 @@ powershell -ExecutionPolicy Bypass -File tests\run_static_tests.ps1
 
 - MinGW-w64 `g++` 构建成功。
 - CLI 帮助、状态、未知参数和有限超时运行。
-- 服务重复安装/更新为同一个 `BLESync` 服务。
-- 服务 `RUNNING`、`LocalSystem`、绝对 EXE 路径、自动/延迟启动。
+- 服务启动类型为 `SERVICE_AUTO_START`，不使用延迟自动启动。
+- 服务 `RUNNING`、`LocalSystem`、绝对 EXE 路径、自动启动（非延迟）。
 - Service Recovery 配置入口已实现。
 - Storage 目录、递归 ACL、快照、备份、SHA-256 元数据和 InstanceId。
 - 当前机器的 `Devices`/`Keys` 在 LocalSystem 服务上下文中的读取与恢复验证。

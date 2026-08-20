@@ -596,7 +596,7 @@ static bool install_service() {
         CloseServiceHandle(manager);
         return false;
     }
-    SERVICE_DELAYED_AUTO_START_INFO delayed{TRUE};
+    SERVICE_DELAYED_AUTO_START_INFO delayed{FALSE};
     ChangeServiceConfig2W(service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
     SC_ACTION actions[3]{{SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 120000}, {SC_ACTION_RESTART, 300000}};
     SERVICE_FAILURE_ACTIONSW failure{};
@@ -635,9 +635,10 @@ static void worker() {
     }
 
     if (config.wifi_enabled) {
-        if (g_wifi.initialize(config.storage, config.wifi_interval, config.log_sensitive_names)) {
+        if (g_wifi.initialize(config.storage, config.wifi_interval, config.log_sensitive_names, config.wifi_sync_on_enable, config.wifi_sync_on_start)) {
             g_log.write(L"信息", L"Wi-Fi 同步模块已初始化，Global Profiles=" + std::to_wstring(g_wifi.global_profile_count()));
             if (config.wifi_sync_on_start) g_wifi.tick(true);
+            protect_storage(config.storage);
         } else {
             g_log.write(L"警告", L"Wi-Fi WLAN API 初始化失败，Bluetooth 继续独立运行");
         }

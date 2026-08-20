@@ -181,7 +181,7 @@ Global\BLESync.StorageLock
 ```text
 账户：LocalSystem
 启动：SERVICE_AUTO_START
-延迟启动：启用
+延迟启动：禁用
 失败恢复：1 分钟、2 分钟、5 分钟后重启
 ```
 
