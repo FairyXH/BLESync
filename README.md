@@ -50,6 +50,44 @@ build\BLESync.ini
 
 构建脚本使用 `--console=plain` 等 Gradle 选项不适用；本项目完全使用 MinGW `g++`，编译输出写入 `build\compile.log`。
 
+## Wi-Fi 同步扩展
+
+BLESync 现已在同一个 `BLESync.exe` / `BLESync` Service 中增加 Wi-Fi Profile 同步。Bluetooth 和 Wi-Fi 共享 Service、配置、Storage、ACL、日志和调度，但业务状态独立：
+
+```text
+Bluetooth = Mirror（增加、修改、删除）
+Wi-Fi     = Global Union + Propagation（增加、修改、永不从 Global 删除）
+```
+
+新增配置保持向后兼容：
+
+```ini
+[BLESync]
+LogSensitiveNames=false
+
+[WiFi]
+Enabled=true
+ScanInterval=5
+SyncOnServiceStart=true
+SyncOnWiFiEnable=true
+```
+
+Wi-Fi 数据保存于：
+
+```text
+StoragePath\wifi\profiles\<sha256>.xml
+StoragePath\wifi\pending\
+```
+
+Wi-Fi 使用 `WlanOpenHandle`、`WlanEnumInterfaces`、`WlanGetProfileList`、`WlanGetProfile`、`WlanSetProfile` 和 `WlanRegisterNotification`。不使用 `netsh` 作为核心同步机制，不调用 `WlanDeleteProfile`，不重启 `WlanSvc`。
+
+当前可见 WLAN Interface 的 Profile 会合并到 Global Union，并传播到所有当前可见 WLAN Interface。适配器拔出后，Windows WLAN API 不允许继续对已移除 Interface GUID 操作；BLESync 保留 Global XML，待接口未来重新出现后再次传播。详细边界见：
+
+- `docs\WifiProfileAnalysis.md`
+- `docs\WifiSyncDesign.md`
+
+Wi-Fi Profile XML 可能包含本机保护的 `keyMaterial` 或企业认证信息。BLESync 不请求 plaintext key、不把 XML/密钥写入日志。DPAPI、WPA3、802.1X/EAP 跨 Windows 可用性必须通过双系统实测，不能由 XML 文件存在性推断。
+
 ## 命令行帮助
 
 ```text
@@ -105,7 +143,12 @@ LogLevel=INFO
 
 | `StoragePath` | `D:\BLESyncData` | 蓝牙快照和日志目录 |
 | `ScanInterval` | `5` | 扫描间隔，单位为秒，最小 1 秒 |
-| `LogLevel` | `INFO` | 日志级别预留配置 |
+| `LogSensitiveNames` | `false` | 默认不记录 Wi-Fi SSID/Profile 名称 |
+| `[Bluetooth] Enabled` | `true` | 保留并显式控制原 Bluetooth 模块 |
+| `[WiFi] Enabled` | `true` | 启用 Wi-Fi Global Union + Propagation |
+| `[WiFi] ScanInterval` | `5` | Wi-Fi fallback 扫描周期，秒 |
+| `[WiFi] SyncOnServiceStart` | `true` | 服务启动时执行 Wi-Fi 扫描/传播 |
+| `[WiFi] SyncOnWiFiEnable` | `true` | Wi-Fi 状态通知后执行同步 |
 
 
 默认结构：
@@ -158,6 +201,12 @@ BUILTIN\Administrators：完全控制
 ```
 
 普通用户不能读取 Storage。Link Key 和其他敏感二进制数据不会进入日志。不要把 StoragePath 配置到普通用户共享目录。
+
+## 已知 Wi-Fi 行为
+
+Wi-Fi 正常运行期间“本地删除不删除 Global，后续可能重新传播”是本项目的明确设计，不是 Windows API 的默认行为。当前 Windows WLAN Native API 只能对当前存在的 Interface GUID 写入 Profile；离线适配器只保留历史 Profile 贡献，重新插入后重新枚举并传播。
+
+当前主机已实际观察到 `Wlansvc\Profiles\Interfaces` 下多个历史 Interface 目录。BLESync 会在只读模式下发现这些 XML 并并入 Global，但不会直接修改 `Wlansvc` 私有文件。
 
 ## 测试
 

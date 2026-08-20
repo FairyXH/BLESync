@@ -36,6 +36,20 @@ BLESync 不重定向整个 Windows Registry Hive，也不替换 `SYSTEM` 文件�
 - Bluetooth 服务状态检测
 - 周期同步
 
+## Wi-Fi Architecture
+
+The service now starts a separate `WifiSyncManager` after the shared Storage mutex is acquired. It uses Native WLAN API and a one-second shared worker loop; Bluetooth registry decisions remain in their existing branch.
+
+- `WlanRegisterNotification` marks Wi-Fi state dirty.
+- The scheduler calls `WifiSyncManager::tick` when dirty or when the Wi-Fi interval expires.
+- Wi-Fi API failures do not stop the Bluetooth branch.
+- Wi-Fi never calls `WlanDeleteProfile`, `netsh`, `StartService`, or `ControlService` for `WlanSvc`.
+- Global profile XML is stored under `StoragePath\wifi\profiles` using hash-based names and atomic replacement.
+- Failed interface propagation creates a pending marker; later scans retry when an interface is available.
+- Offline interfaces are not written while absent; their Global profiles remain stored.
+
+See `docs\WifiProfileAnalysis.md` and `docs\WifiSyncDesign.md` for API evidence, key protection, offline-interface limits, conflict handling, and unverified cross-system DPAPI/EAP boundaries.
+
 ## Registry 快照
 
 快照树由以下对象组成：

@@ -7,6 +7,10 @@ if (-not (Test-Path $ini)) { throw 'BLESync.ini missing.' }
 $text = Get-Content -Raw -Encoding UTF8 $ini
 if (-not [regex]::IsMatch($text, '(?m)^StoragePath=')) { throw 'StoragePath missing.' }
 if (-not [regex]::IsMatch($text, '(?m)^ScanInterval=')) { throw 'ScanInterval missing.' }
+if (-not [regex]::IsMatch($text, '(?m)^LogSensitiveNames=')) { throw 'LogSensitiveNames missing.' }
+if (-not [regex]::IsMatch($text, '(?m)^Enabled=')) { throw 'WiFi Enabled missing.' }
+if (-not [regex]::IsMatch($text, '(?m)^SyncOnWiFiEnable=')) { throw 'WiFi SyncOnWiFiEnable missing.' }
+if (-not [regex]::IsMatch($text, '(?m)^SyncOnBluetoothEnable=')) { throw 'Bluetooth SyncOnBluetoothEnable missing.' }
 function Invoke-BLESync([string]$argument, [int]$timeoutSeconds = 10) {
   $p = Start-Process -FilePath $exe -ArgumentList $argument -PassThru -WindowStyle Hidden
   if (-not $p.WaitForExit($timeoutSeconds * 1000)) {

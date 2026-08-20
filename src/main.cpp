@@ -21,6 +21,7 @@
 #include <cstring>
 #include <iostream>
 #include <functional>
+#include "wifi.h"
 
 static const GUID BLE_DEVICE_CLASS_GUID = {
     0xe0cbf06c,
@@ -40,8 +41,21 @@ static constexpr wchar_t KEY_ROOT[] = L"SYSTEM\\CurrentControlSet\\Services\\BTH
 static std::atomic<bool> g_stop{false};
 static SERVICE_STATUS_HANDLE g_status_handle = nullptr;
 static SERVICE_STATUS g_status{};
+static WifiSyncManager g_wifi;
 
-struct Config { fs::path exe_dir, storage; int interval = 5; std::wstring log_level = L"INFO"; };
+struct Config {
+    fs::path exe_dir, storage;
+    int interval = 5;
+    std::wstring log_level = L"INFO";
+    bool wifi_enabled = true;
+    bool wifi_sync_on_start = true;
+    bool wifi_sync_on_enable = true;
+    int wifi_interval = 5;
+    bool log_sensitive_names = false;
+    bool bluetooth_enabled = true;
+    bool bluetooth_sync_on_start = true;
+    bool bluetooth_sync_on_enable = true;
+};
 struct Value { DWORD type = REG_NONE; std::vector<BYTE> data; };
 struct Key { std::wstring name; std::map<std::wstring, Value> values; std::map<std::wstring, Key> children; };
 struct Snapshot {
@@ -78,6 +92,14 @@ static Config load_config() {
     GetPrivateProfileStringW(L"BLESync", L"StoragePath", L"", buffer, 32768, ini.c_str()); c.storage = fs::path(buffer);
     GetPrivateProfileStringW(L"BLESync", L"LogLevel", L"INFO", buffer, 32768, ini.c_str()); c.log_level = upper(buffer);
     GetPrivateProfileStringW(L"BLESync", L"ScanInterval", L"5", buffer, 32768, ini.c_str()); try { c.interval = std::max(1, std::stoi(buffer)); } catch (...) { c.interval = 5; }
+    GetPrivateProfileStringW(L"WiFi", L"Enabled", L"true", buffer, 32768, ini.c_str()); c.wifi_enabled = lower(buffer) != L"false" && lower(buffer) != L"0";
+    GetPrivateProfileStringW(L"WiFi", L"ScanInterval", L"5", buffer, 32768, ini.c_str()); try { c.wifi_interval = std::max(1, std::stoi(buffer)); } catch (...) { c.wifi_interval = 5; }
+    GetPrivateProfileStringW(L"WiFi", L"SyncOnServiceStart", L"true", buffer, 32768, ini.c_str()); c.wifi_sync_on_start = lower(buffer) != L"false" && lower(buffer) != L"0";
+    GetPrivateProfileStringW(L"WiFi", L"SyncOnWiFiEnable", L"true", buffer, 32768, ini.c_str()); c.wifi_sync_on_enable = lower(buffer) != L"false" && lower(buffer) != L"0";
+    GetPrivateProfileStringW(L"BLESync", L"LogSensitiveNames", L"false", buffer, 32768, ini.c_str()); c.log_sensitive_names = lower(buffer) == L"true" || lower(buffer) == L"1";
+    GetPrivateProfileStringW(L"Bluetooth", L"Enabled", L"true", buffer, 32768, ini.c_str()); c.bluetooth_enabled = lower(buffer) != L"false" && lower(buffer) != L"0";
+    GetPrivateProfileStringW(L"Bluetooth", L"SyncOnServiceStart", L"true", buffer, 32768, ini.c_str()); c.bluetooth_sync_on_start = lower(buffer) != L"false" && lower(buffer) != L"0";
+    GetPrivateProfileStringW(L"Bluetooth", L"SyncOnBluetoothEnable", L"true", buffer, 32768, ini.c_str()); c.bluetooth_sync_on_enable = lower(buffer) != L"false" && lower(buffer) != L"0";
     if (c.storage.empty()) { c.storage = c.exe_dir / L"BLESyncData"; }
     return c;
 }
@@ -612,6 +634,17 @@ static void worker() {
         return;
     }
 
+    if (config.wifi_enabled) {
+        if (g_wifi.initialize(config.storage, config.wifi_interval, config.log_sensitive_names)) {
+            g_log.write(L"信息", L"Wi-Fi 同步模块已初始化，Global Profiles=" + std::to_wstring(g_wifi.global_profile_count()));
+            if (config.wifi_sync_on_start) g_wifi.tick(true);
+        } else {
+            g_log.write(L"警告", L"Wi-Fi WLAN API 初始化失败，Bluetooth 继续独立运行");
+        }
+    }
+
+    protect_storage(config.storage);
+
     const std::wstring machine_id = read_or_create_instance_id(config.storage);
     uint64_t snapshot_version = read_snapshot_version(config.storage);
     bool restoring = false;
@@ -628,7 +661,8 @@ static void worker() {
     const fs::path keys_file = config.storage / L"registry" / L"keys.regdata";
 
     while (!g_stop) {
-        const auto service = service_state(L"bthserv");
+        if (config.bluetooth_enabled) {
+            const auto service = service_state(L"bthserv");
         bool radio_known = false;
         bool radio_enabled = false;
         radio_state(radio_known, radio_enabled);
@@ -735,6 +769,12 @@ static void worker() {
             g_log.write(L"调试", L"蓝牙适配器不可用或已禁用，不自动启用或重启服务");
         }
 
+        }
+
+        if (config.wifi_enabled && g_wifi.available()) {
+            g_wifi.tick(false);
+        }
+
         for (int i = 0; i < config.interval && !g_stop; ++i) {
             if (!g_stop) {
                 std::this_thread::sleep_for(1s);
@@ -742,6 +782,7 @@ static void worker() {
         }
     }
 
+    g_wifi.shutdown();
     ReleaseMutex(mutex);
     CloseHandle(mutex);
     g_log.write(L"信息", L"服务工作线程已停止");
