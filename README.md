@@ -1,6 +1,6 @@
 # BLESync
 
-BLESync 是一个以 Windows `LocalSystem` 权限运行的蓝牙状态持久化服务。它将经过筛选的 Bluetooth Port 注册表状态保存到非系统分区，目标是让使用同一物理蓝牙适配器的两个 Windows 安装之间共享配对状态。
+BLESync 是一个以 Windows `LocalSystem` 权限运行的蓝牙状态持久化服务。它将经过筛选的 Bluetooth Port 注册表状态保存到非系统分区，目标是让使用同一物理蓝牙适配器的两个 Windows 安装之间共享配对状态，或者在冰点还原等硬盘保护环境下持久化保存蓝牙设备到解冻分区。
 
 ## 当前实现范围
 
