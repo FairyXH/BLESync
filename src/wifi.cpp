@@ -47,6 +47,13 @@ std::wstring trim_xml(std::wstring value) {
     return result;
 }
 
+bool is_enterprise_profile(const std::wstring& xml) {
+    return xml.find(L"<useOneX>true</useOneX>") != std::wstring::npos
+        || xml.find(L"<authentication>WPA2</authentication>") != std::wstring::npos
+        || xml.find(L"<authentication>WPA3ENT</authentication>") != std::wstring::npos
+        || xml.find(L"<authentication>WPA</authentication>") != std::wstring::npos;
+}
+
 bool write_atomic(const std::filesystem::path& path, const std::string& data) {
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
@@ -234,7 +241,11 @@ bool WifiSyncManager::merge_global(const std::vector<WifiProfileRecord>& local_p
             global.connected_observed = local.connected;
             global.user_profile = local.user_profile;
             global.group_policy = local.group_policy;
-            global.propagatable = !local.group_policy;
+            // An 802.1X profile XML does not contain the current user's EAP credential blob.
+            // Replaying it from LocalSystem can therefore erase a working per-user setup and make
+            // Windows prompt for credentials. Archive enterprise XML, but leave its ownership to
+            // NetworkGuardian (or Windows) and never propagate it across interfaces.
+            global.propagatable = !local.group_policy && !is_enterprise_profile(local.xml);
             global.source_interfaces.insert(guid_text(local.interface_guid));
             global_profiles_.emplace(global.hash, std::move(global));
             changed = true;
@@ -245,7 +256,7 @@ bool WifiSyncManager::merge_global(const std::vector<WifiProfileRecord>& local_p
             it->second.connected_observed = local.connected;
             it->second.user_profile = local.user_profile;
             it->second.group_policy = local.group_policy;
-            it->second.propagatable = !local.group_policy;
+            it->second.propagatable = !local.group_policy && !is_enterprise_profile(local.xml);
             it->second.last_observed_tick = std::max(it->second.last_observed_tick, local.observed_tick);
             it->second.source_interfaces.insert(guid_text(local.interface_guid));
             changed = changed || local_changed;
@@ -277,6 +288,7 @@ bool WifiSyncManager::load_global() {
         profile.name = extract_tag(xml, L"name");
         if (profile.name.empty()) profile.name = entry.path().stem().wstring();
         profile.identity = stable_identity(profile.name, xml);
+        profile.propagatable = !is_enterprise_profile(xml);
         global_profiles_[profile.hash] = std::move(profile);
     }
     return true;
@@ -327,6 +339,7 @@ bool WifiSyncManager::propagate() {
 }
 
 bool WifiSyncManager::set_profile_on_interface(const GUID& interface_guid, const WifiGlobalProfile& profile) {
+    if (is_enterprise_profile(profile.xml)) return true;
     DWORD reason = 0;
     const DWORD result = WlanSetProfile(
         wlan_handle_,
