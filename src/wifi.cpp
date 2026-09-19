@@ -320,9 +320,15 @@ bool WifiSyncManager::propagate() {
             continue;
         }
         const WifiGlobalProfile* current = it->second;
-        if ((!current->connected_observed && profile.connected_observed)
-            || (current->connected_observed == profile.connected_observed
-                && profile.last_observed_tick > current->last_observed_tick)) {
+        const bool current_manual = current->xml.find(L"<connectionMode>manual</connectionMode>") != std::wstring::npos;
+        const bool candidate_manual = profile.xml.find(L"<connectionMode>manual</connectionMode>") != std::wstring::npos;
+        // Manual mode is an explicit policy decision (NetworkGuardian uses it to stop several
+        // adapters auto-joining one SSID). Never let an older connected/auto variant overwrite it.
+        if ((!current_manual && candidate_manual)
+            || (current_manual == candidate_manual
+                && ((!current->connected_observed && profile.connected_observed)
+                    || (current->connected_observed == profile.connected_observed
+                        && profile.last_observed_tick > current->last_observed_tick)))) {
             it->second = &profile;
         }
     }

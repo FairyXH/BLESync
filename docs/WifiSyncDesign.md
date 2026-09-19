@@ -23,6 +23,7 @@ WLAN API 只允许针对当前存在的 Interface GUID 读写。适配器拔出�
 - 不直接改写 `C:\ProgramData\Microsoft\Wlansvc`。
 - `Wlansvc\Profiles\Interfaces` 只读扫描作为离线历史发现 fallback；若权限或格式不允许则记录 Pending，不影响服务。
 - 802.1X/EAP 企业 Profile 只归档、不传播。EAP 用户凭据是当前用户的独立数据，LocalSystem 仅重放 Profile XML 会丢失凭据并触发 Windows 账号密码弹窗；企业网络由 NetworkGuardian 或 Windows 自身维护。
+- 同名个人网络同时存在 `manual` 与 `auto` 版本时优先传播 `manual`，避免覆盖 NetworkGuardian 为“一 SSID 一网卡”设置的禁止自动重连状态。
 
 ## 数据目录
 
